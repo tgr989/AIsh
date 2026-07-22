@@ -184,7 +184,7 @@ expect_ok finish_health_check 0 0 strict >/dev/null 2>&1
 CLI_MODE="menu"
 expect_ok handle_cli_args --check-strict
 [[ "$CLI_MODE" == "check-strict" ]] || fail '--check-strict did not select strict mode'
-[[ "$SCRIPT_VERSION" == "2.1.8" ]] || fail 'unexpected script version'
+[[ "$SCRIPT_VERSION" == "2.1.9" ]] || fail 'unexpected script version'
 
 attn_src="$(declare -f environment_needs_attention)"
 grep -Fq 'runtime_rules_match_loaded_config' <<< "$attn_src" \
@@ -197,6 +197,18 @@ expect_ok ipv4_is_rfc1918 192.168.1.1
 expect_ok ipv4_is_rfc1918 172.16.0.1
 expect_fail ipv4_is_rfc1918 203.0.113.10
 expect_fail ipv4_is_rfc1918 127.0.0.1
+
+legacy_masq='        ct status dnat ct original ip daddr 10.42.0.16 ct original proto-dst 3146 ip daddr 21.11.17.16 tcp dport 31046 masquerade'
+normalized_masq="$(normalize_runtime_nft_dump <<< "$legacy_masq")"
+[[ "$normalized_masq" == *'meta l4proto tcp ct original proto-dst 3146'* ]] \
+    || fail 'normalize_runtime_nft_dump did not inject meta l4proto for tcp'
+legacy_udp='        ct status dnat ct original ip daddr 10.42.0.16 ct original proto-dst 3146 ip daddr 21.11.17.16 udp dport 31046 masquerade'
+normalized_udp="$(normalize_runtime_nft_dump <<< "$legacy_udp")"
+[[ "$normalized_udp" == *'meta l4proto udp ct original proto-dst 3146'* ]] \
+    || fail 'normalize_runtime_nft_dump did not inject meta l4proto for udp'
+already_ok='        ct status dnat ct original ip daddr 10.42.0.16 meta l4proto tcp ct original proto-dst 3146 ip daddr 21.11.17.16 tcp dport 31046 masquerade'
+[[ "$(normalize_runtime_nft_dump <<< "$already_ok")" == "$already_ok" ]] \
+    || fail 'normalize_runtime_nft_dump altered a complete rule'
 
 nft() {
     printf '%s\n' 'Error: syntax error' >&2

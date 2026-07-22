@@ -19,7 +19,7 @@ TABLE_NAME="portfwd"
 CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
-SCRIPT_VERSION="2.1.8"
+SCRIPT_VERSION="2.1.9"
 
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/portfwd.conf"
@@ -569,6 +569,21 @@ check_runtime_ownership() {
     return 1
 }
 
+# nft list 可能省略 meta l4proto；重新加载时 ct original proto-dst
+# 没有 L4 上下文会报 "Can't parse symbolic invalid expressions"。
+normalize_runtime_nft_dump() {
+    local line proto
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == *"ct original proto-dst"* && "$line" != *"meta l4proto"* ]]; then
+            if [[ "$line" =~ [[:space:]](tcp|udp)[[:space:]]+dport[[:space:]] ]]; then
+                proto="${BASH_REMATCH[1]}"
+                line="${line/ct original proto-dst/meta l4proto ${proto} ct original proto-dst}"
+            fi
+        fi
+        printf '%s\n' "$line"
+    done
+}
+
 build_runtime_rollback() {
     local output_path="$1"
     if ! {
@@ -576,7 +591,7 @@ build_runtime_rollback() {
         printf 'add table %s %s\n' "$TABLE_FAMILY" "$TABLE_NAME"
         printf 'delete table %s %s\n\n' "$TABLE_FAMILY" "$TABLE_NAME"
         if runtime_table_exists; then
-            nft list table "$TABLE_FAMILY" "$TABLE_NAME"
+            nft list table "$TABLE_FAMILY" "$TABLE_NAME" | normalize_runtime_nft_dump
         fi
     } > "$output_path"; then
         err "生成运行态回滚文件失败。"
@@ -1142,7 +1157,11 @@ run_health_check() {
         runtime_table_is_owned \
             && info "运行表所有权哨兵存在。" \
             || { err "运行表缺少所有权哨兵。"; status=1; }
-        runtime_output="$(nft -nn list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)" || status=1
+        if runtime_output="$(nft -nn list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)"; then
+            runtime_output="$(normalize_runtime_nft_dump <<< "$runtime_output")"
+        else
+            status=1
+        fi
         if (( config_ok )) && runtime_rules_match_loaded_config "$runtime_output"; then
             info "运行态链结构及每条 DNAT/MASQUERADE 表达式与配置一致。"
         else
