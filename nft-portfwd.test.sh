@@ -35,6 +35,22 @@ expect_fail validate_ipv4_cidr 203.0.113.0/33
 expect_ok validate_ifname eth0
 expect_fail validate_ifname interface-name-too-long
 
+expect_ok ss_listen_line_has_port 8080 'LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*'
+expect_ok ss_listen_line_has_port 8080 'LISTEN 0 128 *:8080 *:*'
+expect_fail ss_listen_line_has_port 80 'LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*'
+expect_fail ss_listen_line_has_port 8080 'LISTEN 0 128 0.0.0.0:8081 0.0.0.0:*'
+
+can_probe_tcp_connect() { return 0; }
+probe_tcp_connect() { return 0; }
+confirm_out="$(confirm_continue_despite_unreachable_dest 10.0.0.2 443)"
+grep -Fq 'TCP 可达' <<< "$confirm_out" || fail 'reachable dest did not report success'
+probe_tcp_connect() { return 1; }
+read_or_cancel() { printf -v "$1" '%s' 'n'; }
+expect_fail confirm_continue_despite_unreachable_dest 10.0.0.2 443 >/dev/null
+read_or_cancel() { printf -v "$1" '%s' 'y'; }
+expect_ok confirm_continue_despite_unreachable_dest 10.0.0.2 443 >/dev/null
+unset -f can_probe_tcp_connect probe_tcp_connect read_or_cancel
+
 RULES=("192.0.2.10|8443|tcp|10.0.0.2|443|eth0|203.0.113.0/24")
 expect_ok rule_conflicts 192.0.2.10 8443 tcp eth0
 expect_fail rule_conflicts 192.0.2.10 8443 tcp eth1
@@ -184,7 +200,13 @@ expect_ok finish_health_check 0 0 strict >/dev/null 2>&1
 CLI_MODE="menu"
 expect_ok handle_cli_args --check-strict
 [[ "$CLI_MODE" == "check-strict" ]] || fail '--check-strict did not select strict mode'
-[[ "$SCRIPT_VERSION" == "2.1.9" ]] || fail 'unexpected script version'
+[[ "$SCRIPT_VERSION" == "2.2" ]] || fail 'unexpected script version'
+help_out="$(print_help)"
+grep -Fq "$CONF_FILE" <<< "$help_out" || fail 'help omitted managed conf path'
+grep -Fq "$SYSCTL_FILE" <<< "$help_out" || fail 'help omitted sysctl path'
+grep -Fq "$TXN_MARKER" <<< "$help_out" || fail 'help omitted transaction marker path'
+grep -Fq '不会自动改动' <<< "$help_out" || fail 'help omitted non-touch summary'
+
 
 attn_src="$(declare -f environment_needs_attention)"
 grep -Fq 'runtime_rules_match_loaded_config' <<< "$attn_src" \

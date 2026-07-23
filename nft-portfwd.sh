@@ -19,7 +19,7 @@ TABLE_NAME="portfwd"
 CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
-SCRIPT_VERSION="2.1.9"
+SCRIPT_VERSION="2.2"
 
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/portfwd.conf"
@@ -263,6 +263,92 @@ ipv4_is_rfc1918() {
     (( o1 == 192 && o2 == 168 )) && return 0
     (( o1 == 172 && o2 >= 16 && o2 <= 31 )) && return 0
     return 1
+}
+
+# ss 监听行是否包含指定端口（避免 :80 误匹配 :8080）。
+ss_listen_line_has_port() {
+    local port="$1" line="$2"
+    [[ "$line" =~ :${port}[[:space:]] ]]
+}
+
+# 通过 stdout 返回 TCP / UDP / TCP+UDP；未占用或无法检测时返回空并 exit 1。
+describe_local_port_occupancy() {
+    local port="${1:-}" line tcp=0 udp=0
+    validate_port "$port" || return 1
+    command -v ss >/dev/null 2>&1 || return 1
+
+    while IFS= read -r line; do
+        ss_listen_line_has_port "$port" "$line" && tcp=1 && break
+    done < <(ss -H -ltn 2>/dev/null || true)
+
+    while IFS= read -r line; do
+        ss_listen_line_has_port "$port" "$line" && udp=1 && break
+    done < <(ss -H -lun 2>/dev/null || true)
+
+    if (( tcp && udp )); then
+        printf '%s\n' 'TCP+UDP'
+    elif (( tcp )); then
+        printf '%s\n' 'TCP'
+    elif (( udp )); then
+        printf '%s\n' 'UDP'
+    else
+        return 1
+    fi
+    return 0
+}
+
+# 交互：本机端口已被监听时警告；继续返回 0，取消返回 1。
+confirm_continue_despite_local_port_use() {
+    local port="$1" occupied="" ans
+    occupied="$(describe_local_port_occupancy "$port" 2>/dev/null)" || return 0
+    [[ -n "$occupied" ]] || return 0
+
+    warn "本机端口 ${port} 已被占用（${occupied}）。"
+    warn "添加转发后，外部访问该端口的流量会被 DNAT；本机原服务可能无法从外部到达。"
+    read_or_cancel ans "是否仍要继续添加？[y/N]: " || return 1
+    answer_yes_default_no "$ans" || {
+        warn "已取消。"
+        return 1
+    }
+    return 0
+}
+
+# TCP 连通探测；成功 0，失败 1。依赖 bash /dev/tcp；有 timeout 时限制等待。
+can_probe_tcp_connect() {
+    command -v timeout >/dev/null 2>&1
+}
+
+probe_tcp_connect() {
+    local ip="${1:-}" port="${2:-}" wait_sec="${3:-3}"
+    validate_ipv4_basic "$ip" || return 1
+    validate_port "$port" || return 1
+    can_probe_tcp_connect || return 1
+
+    timeout "$wait_sec" bash -c "echo >/dev/tcp/${ip}/${port}" 2>/dev/null
+}
+
+# 交互：添加规则前探测目标 TCP；不通时确认。继续返回 0，取消返回 1。
+confirm_continue_despite_unreachable_dest() {
+    local ip="$1" port="$2" ans
+
+    if ! can_probe_tcp_connect; then
+        warn "跳过目标连通性探测：未找到 timeout 命令。"
+        return 0
+    fi
+
+    info "正在探测目标 TCP ${ip}:${port}（超时 3s）..."
+    if probe_tcp_connect "$ip" "$port" 3; then
+        info "目标 ${ip}:${port} TCP 可达。"
+        return 0
+    fi
+
+    warn "目标 ${ip}:${port} TCP 不通或超时（不等于 NAT 会失败；若目标仅 UDP 可忽略）。"
+    read_or_cancel ans "是否仍要继续添加？[y/N]: " || return 1
+    answer_yes_default_no "$ans" || {
+        warn "已取消。"
+        return 1
+    }
+    return 0
 }
 
 # 运行 nft 校验/加载；失败时把 nft 原始报错打到 stderr。
@@ -1034,8 +1120,11 @@ show_tips() {
 1. 模式固定为 DNAT + MASQUERADE（后端看不到真实客户端 IP）。
 2. 添加时必须明确监听 IPv4（可按序号选本机地址），并可限制来源 CIDR / 入口网卡。
    云厂商若公网 IP 未挂在网卡上，请选内网 IP（包到达本机时的目的地址）。
+   若本机端口已被服务占用，会警告并请你确认。
+   输入目标后会做一次 TCP 连通探测；不通可确认后仍继续。
 3. 删除时按列表序号；输入 all 可清空。
 4. 菜单 4 可检查/修复 include 与 ip_forward；不会自动启动通用 nftables.service。
+   --check 只做运行态/持久化校验，不对目标做网络探测。
 
 安全边界：
 1. 仅管理 table ${TABLE_FAMILY} ${TABLE_NAME}。
@@ -1085,13 +1174,37 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION}
 参数:
     -h, --help       显示帮助并退出
     -v, --version    显示版本并退出
-    -c, --check      检查当前运行态；持久化问题仅警告
+    -c, --check      检查当前运行态；持久化问题仅警告（不做目标网络探测）
     --check-strict   严格检查；持久化问题也返回失败
 
 说明:
     - 默认进入交互菜单模式
     - 菜单与两种 --check 需要 root 权限；--help/--version 不需要
     - 健康检查不修改系统配置
+
+可能生成或改动的路径（按需，非每次全写）:
+    ${CONF_DIR}/
+        配置目录（首次需要时创建）
+    ${CONF_FILE}
+        正式转发规则（每次成功提交覆盖，无历史副本）
+    ${MAIN_CONF}
+        补 include "${INCLUDE_GLOB}"；若文件不存在则创建最小主配置
+    ${MAIN_CONF}.bak.XXXXXX
+        修改已有主配置前的一次性备份（成功后保留；已有 include 时不再生成）
+    ${SYSCTL_FILE}
+        仅在确认持久化时写入 net.ipv4.ip_forward=1
+    ${RUNTIME_DIR}/
+    ${LOCK_FILE}
+        运行时互斥锁（通常位于 /run，重启后消失）
+    ${TXN_CANDIDATE}
+    ${TXN_ROLLBACK}
+    ${TXN_MARKER}
+        提交事务中间文件；正常成功后清理，异常时可能残留供恢复/排查
+    运行态 table ${TABLE_FAMILY} ${TABLE_NAME}
+        以及可选的 net.ipv4.ip_forward=1（内核，非文件）
+
+不会自动改动: firewalld / ufw / iptables、nftables.service 开机状态、BBR；
+也不会写操作日志或无限累积 portfwd.conf 备份。
 EOF
 }
 
@@ -1398,12 +1511,16 @@ add_rule_interactive() {
         err "格式应为 IPv4:端口，例如 10.0.0.2:8080"
     done
 
+    confirm_continue_despite_unreachable_dest "$dip" "$dport" || return 0
+
     while true; do
         read_or_cancel lport "本机监听端口 [默认 ${dport}]: " || return 0
         lport="${lport:-$dport}"
         validate_port "$lport" && break
         err "端口无效。"
     done
+
+    confirm_continue_despite_local_port_use "$lport" || return 0
 
     prompt_listen_ipv4 listen_ip || return 0
     prompt_source_cidr source_cidr || return 0
