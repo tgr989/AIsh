@@ -200,12 +200,43 @@ expect_ok finish_health_check 0 0 strict >/dev/null 2>&1
 CLI_MODE="menu"
 expect_ok handle_cli_args --check-strict
 [[ "$CLI_MODE" == "check-strict" ]] || fail '--check-strict did not select strict mode'
-[[ "$SCRIPT_VERSION" == "2.2" ]] || fail 'unexpected script version'
+[[ "$SCRIPT_VERSION" == "2.2.2" ]] || fail 'unexpected script version'
 help_out="$(print_help)"
 grep -Fq "$CONF_FILE" <<< "$help_out" || fail 'help omitted managed conf path'
 grep -Fq "$SYSCTL_FILE" <<< "$help_out" || fail 'help omitted sysctl path'
 grep -Fq "$TXN_MARKER" <<< "$help_out" || fail 'help omitted transaction marker path'
 grep -Fq '不会自动改动' <<< "$help_out" || fail 'help omitted non-touch summary'
+
+del_idxs=()
+expect_ok parse_rule_delete_selection '1,3 5' 5 del_idxs
+[[ "${del_idxs[*]}" == "0 2 4" ]] || fail 'comma/space multi-select parse failed'
+expect_ok parse_rule_delete_selection '3 1 3' 5 del_idxs
+[[ "${del_idxs[*]}" == "0 2" ]] || fail 'delete selection did not dedupe/sort'
+expect_ok parse_rule_delete_selection '1，2' 5 del_idxs
+[[ "${del_idxs[*]}" == "0 1" ]] || fail 'fullwidth comma parse failed'
+# 空格 + 英文逗号 + 中文逗号任意混用；3+ 展开为 3、4
+expect_ok parse_rule_delete_selection $'1, 2\xef\xbc\x8c3+ 5' 5 del_idxs
+[[ "${del_idxs[*]}" == "0 1 2 3 4" ]] || fail 'mixed space/comma/fullwidth-comma parse failed'
+expect_ok parse_rule_delete_selection '3+' 5 del_idxs
+[[ "${del_idxs[*]}" == "2 3" ]] || fail 'n+ parse failed'
+expect_ok parse_rule_delete_selection '3-' 5 del_idxs
+[[ "${del_idxs[*]}" == "1 2" ]] || fail 'n- parse failed'
+expect_ok parse_rule_delete_selection '2+ 5-' 5 del_idxs
+[[ "${del_idxs[*]}" == "1 2 3 4" ]] || fail 'mixed n+/n- parse failed'
+boundary_err="$(mktemp)"
+expect_ok parse_rule_delete_selection '1-' 5 del_idxs >"$boundary_err"
+[[ "${del_idxs[*]}" == "0" ]] || fail '1- boundary should keep only first'
+grep -Fq '仅保留 1' "$boundary_err" || fail '1- boundary warning missing'
+expect_ok parse_rule_delete_selection '5+' 5 del_idxs >"$boundary_err"
+[[ "${del_idxs[*]}" == "4" ]] || fail '5+ boundary should keep only last'
+grep -Fq '仅保留 5' "$boundary_err" || fail '5+ boundary warning missing'
+expect_ok parse_rule_delete_selection '1+' 1 del_idxs >"$boundary_err"
+[[ "${del_idxs[*]}" == "0" ]] || fail 'single-rule 1+ should keep only item 1'
+rm -f "$boundary_err"
+expect_fail parse_rule_delete_selection '1,all' 5 del_idxs >/dev/null
+expect_fail parse_rule_delete_selection '9' 5 del_idxs >/dev/null
+expect_fail parse_rule_delete_selection '0' 5 del_idxs >/dev/null
+expect_fail parse_rule_delete_selection '9+' 5 del_idxs >/dev/null
 
 
 attn_src="$(declare -f environment_needs_attention)"

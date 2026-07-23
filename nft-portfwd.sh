@@ -19,7 +19,7 @@ TABLE_NAME="portfwd"
 CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
-SCRIPT_VERSION="2.2"
+SCRIPT_VERSION="2.2.2"
 
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/portfwd.conf"
@@ -1122,7 +1122,8 @@ show_tips() {
    云厂商若公网 IP 未挂在网卡上，请选内网 IP（包到达本机时的目的地址）。
    若本机端口已被服务占用，会警告并请你确认。
    输入目标后会做一次 TCP 连通探测；不通可确认后仍继续。
-3. 删除时按列表序号；输入 all 可清空。
+3. 删除时按列表序号；可用空格或逗号多选（如 1 3 5 或 1,3,5）；
+   也支持 n+（第 n 与 n+1 条）、n-（第 n 与 n-1 条）；越界邻居会跳过并警告；输入 all 可清空。
 4. 菜单 4 可检查/修复 include 与 ip_forward；不会自动启动通用 nftables.service。
    --check 只做运行态/持久化校验，不对目标做网络探测。
 
@@ -1635,12 +1636,13 @@ delete_rule_interactive() {
 
     list_rules
 
-    local choice ans idx
+    local choice ans idx i r
     local victim listen_ip lport proto dip dport iif source_cidr
-    local -a new_rules=()
+    local -a del_idxs=() new_rules=()
+    local -A del_set=()
 
     while true; do
-        read_or_cancel choice "请输入序号删除（all=清空，0=取消）: " || return 0
+        read_or_cancel choice "请输入序号删除（多选: 空格/逗号；n+/n-；all=清空；0=取消）: " || return 0
         [[ -n "${choice:-}" ]] || {
             err "输入不能为空。"
             continue
@@ -1656,33 +1658,35 @@ delete_rule_interactive() {
             return $?
         fi
 
-        if [[ "$choice" =~ ^[1-9][0-9]*$ ]]; then
-            idx=$(( choice - 1 ))
-            if (( idx >= 0 && idx < ${#RULES[@]} )); then
-                break
-            fi
-            err "序号超出范围（1-${#RULES[@]}）。"
-            continue
+        if parse_rule_delete_selection "$choice" "${#RULES[@]}" del_idxs; then
+            break
         fi
-
-        err "请输入列表序号、all 或 0。"
     done
 
-    victim="${RULES[$idx]}"
-    IFS='|' read -r listen_ip lport proto dip dport iif source_cidr <<< "$victim"
-    iif="${iif:-*}"
-
     echo
-    info "将删除: ${proto} ${listen_ip}:${lport} -> ${dip}:${dport} (iif=${iif}, source=${source_cidr})"
+    info "将删除 ${#del_idxs[@]} 条规则:"
+    for idx in "${del_idxs[@]}"; do
+        victim="${RULES[$idx]}"
+        IFS='|' read -r listen_ip lport proto dip dport iif source_cidr <<< "$victim"
+        iif="${iif:-*}"
+        echo "  ${proto} ${listen_ip}:${lport} -> ${dip}:${dport} (iif=${iif}, source=${source_cidr})"
+    done
+
     read_or_cancel ans "确认继续? [y/N]: " || return 0
     answer_yes_default_no "$ans" || {
         warn "已取消。"
         return 0
     }
 
-    local i=0 r
+    del_set=()
+    for idx in "${del_idxs[@]}"; do
+        del_set["$idx"]=1
+    done
+
+    new_rules=()
+    i=0
     for r in "${RULES[@]+"${RULES[@]}"}"; do
-        if (( i != idx )); then
+        if [[ -z "${del_set[$i]:-}" ]]; then
             new_rules+=("$r")
         fi
         (( ++i ))
@@ -1691,9 +1695,99 @@ delete_rule_interactive() {
     RULES=("${new_rules[@]+"${new_rules[@]}"}")
     commit_rules || return 1
 
-    info "删除成功。"
+    info "已删除 ${#del_idxs[@]} 条。"
     [[ ${#RULES[@]} -ne 0 ]] \
         || warn "规则已清空；为避免影响其他路由/VPN/容器，不会自动关闭 IPv4 forwarding。"
+}
+
+# 解析删除序号（1-based，空格/逗号分隔，支持中文逗号）。
+# 支持 n+（n 与 n+1）、n-（n 与 n-1）；越界邻居跳过并警告。
+# 通过 nameref 写回去重后的 0-based 下标（按升序）。成功 0，失败 1。
+parse_rule_delete_selection() {
+    local input="$1"
+    local max="$2"
+    local -n _idxs_out="$3"
+    local normalized token n idx neighbor zero_based
+    local -A seen=()
+    local -a tokens=() raw=() sorted=()
+
+    _idxs_out=()
+    normalized="${input//，/,}"
+    normalized="${normalized//,/ }"
+    read -ra tokens <<< "$normalized"
+    (( ${#tokens[@]} > 0 )) || {
+        err "请输入至少一个序号。"
+        return 1
+    }
+
+    for token in "${tokens[@]}"; do
+        if [[ "$token" =~ ^([1-9][0-9]*)\+$ ]]; then
+            n=$((10#${BASH_REMATCH[1]}))
+            if (( n < 1 || n > max )); then
+                err "序号超出范围：${n}+（1-${max}）。"
+                return 1
+            fi
+            zero_based=$((n - 1))
+            if [[ -z "${seen[$zero_based]:-}" ]]; then
+                seen["$zero_based"]=1
+                raw+=("$zero_based")
+            fi
+            neighbor=$((n + 1))
+            if (( neighbor <= max )); then
+                zero_based=$((neighbor - 1))
+                if [[ -z "${seen[$zero_based]:-}" ]]; then
+                    seen["$zero_based"]=1
+                    raw+=("$zero_based")
+                fi
+            else
+                warn "${n}+ 的下一档 ${neighbor} 超出范围（共 ${max} 条），仅保留 ${n}。"
+            fi
+        elif [[ "$token" =~ ^([1-9][0-9]*)-$ ]]; then
+            n=$((10#${BASH_REMATCH[1]}))
+            if (( n < 1 || n > max )); then
+                err "序号超出范围：${n}-（1-${max}）。"
+                return 1
+            fi
+            zero_based=$((n - 1))
+            if [[ -z "${seen[$zero_based]:-}" ]]; then
+                seen["$zero_based"]=1
+                raw+=("$zero_based")
+            fi
+            neighbor=$((n - 1))
+            if (( neighbor >= 1 )); then
+                zero_based=$((neighbor - 1))
+                if [[ -z "${seen[$zero_based]:-}" ]]; then
+                    seen["$zero_based"]=1
+                    raw+=("$zero_based")
+                fi
+            else
+                warn "${n}- 的上一档不存在（已是首条），仅保留 ${n}。"
+            fi
+        elif [[ "$token" =~ ^[1-9][0-9]*$ ]]; then
+            n=$((10#$token))
+            if (( n < 1 || n > max )); then
+                err "序号超出范围：${n}（1-${max}）。"
+                return 1
+            fi
+            zero_based=$((n - 1))
+            if [[ -z "${seen[$zero_based]:-}" ]]; then
+                seen["$zero_based"]=1
+                raw+=("$zero_based")
+            fi
+        else
+            err "无效序号：${token}（支持正整数、n+、n-；多选用空格或逗号；all/0 请单独输入）。"
+            return 1
+        fi
+    done
+
+    (( ${#raw[@]} > 0 )) || {
+        err "请输入至少一个序号。"
+        return 1
+    }
+
+    mapfile -t sorted < <(printf '%s\n' "${raw[@]}" | sort -n)
+    _idxs_out=("${sorted[@]}")
+    return 0
 }
 
 clear_rules_interactive() {
