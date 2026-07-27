@@ -188,17 +188,17 @@ install_dependencies() {
      command -v openssl >/dev/null 2>&1 &&
      command -v base64 >/dev/null 2>&1 &&
      command -v ss >/dev/null 2>&1 &&
-     command -v python3 >/dev/null 2>&1; then
+     command -v jq >/dev/null 2>&1; then
     return
   fi
 
-  log "安装 curl、OpenSSL、CA 证书、python3 和端口检查工具..."
+  log "安装 curl、OpenSSL、CA 证书、jq 和端口检查工具..."
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y curl openssl ca-certificates coreutils iproute2 python3
+    apt-get install -y curl openssl ca-certificates coreutils iproute2 jq
   else
-    die "未找到 apt-get；请先安装 curl、openssl、ca-certificates、coreutils、iproute2 和 python3。"
+    die "未找到 apt-get；请先安装 curl、openssl、ca-certificates、coreutils、iproute2 和 jq。"
   fi
 }
 
@@ -525,7 +525,7 @@ github_api_get() {
 
 json_get() {
   local key="$1"
-  python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "${key}"
+  jq -er --arg key "${key}" '.[$key] | strings' 2>/dev/null
 }
 
 git_blob_sha1() {
@@ -542,13 +542,14 @@ fetch_official_installer() {
   local content_json=""
   local expected_blob=""
   local actual_blob=""
+  local encoding=""
 
   log "获取 ${INSTALLER_REPO}@${INSTALLER_REF} 最新 commit..."
   commit_json="$(
     github_api_get "${INSTALLER_API}/commits/${INSTALLER_REF}"
   )" || die "无法解析 ${INSTALLER_REPO}@${INSTALLER_REF} 的最新 commit。"
   INSTALLER_COMMIT="$(
-    json_get sha <<<"${commit_json}" 2>/dev/null
+    json_get sha <<<"${commit_json}"
   )" || die "无法从 GitHub 响应解析 commit SHA。"
   [[ "${INSTALLER_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
     die "GitHub 返回的 commit SHA 无效：${INSTALLER_COMMIT}"
@@ -559,18 +560,17 @@ fetch_official_installer() {
       "${INSTALLER_API}/contents/install-release.sh?ref=${INSTALLER_COMMIT}"
   )" || die "无法获取 install-release.sh 元数据。"
   expected_blob="$(
-    json_get sha <<<"${content_json}" 2>/dev/null
+    json_get sha <<<"${content_json}"
   )" || die "无法从 GitHub 响应解析安装器 blob SHA。"
   [[ "${expected_blob}" =~ ^[0-9a-f]{40}$ ]] ||
     die "GitHub 返回的安装器 blob SHA 无效：${expected_blob}"
 
-  if ! python3 -c '
-import base64, json, sys
-obj = json.load(sys.stdin)
-if obj.get("encoding") != "base64":
-    raise SystemExit("unexpected encoding: %r" % (obj.get("encoding"),))
-sys.stdout.buffer.write(base64.b64decode(obj["content"]))
-' <<<"${content_json}" >"${dest}" 2>/dev/null; then
+  encoding="$(json_get encoding <<<"${content_json}" || true)"
+  [[ "${encoding}" == "base64" ]] ||
+    die "GitHub 返回的安装器编码不是 base64：${encoding:-<empty>}"
+  if ! jq -er '.content | strings' <<<"${content_json}" 2>/dev/null |
+    tr -d '[:space:]' |
+    base64 -d >"${dest}" 2>/dev/null; then
     die "无法从 GitHub 响应解析安装器内容。"
   fi
 
