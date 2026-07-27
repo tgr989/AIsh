@@ -19,7 +19,7 @@ TABLE_NAME="portfwd"
 CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
-SCRIPT_VERSION="2.2.2"
+SCRIPT_VERSION="2.2.3"
 
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/portfwd.conf"
@@ -56,6 +56,7 @@ CLI_MODE="menu"
 IPF_WANT_ENABLE=0
 IPF_WANT_PERSIST=0
 IPF_ORIGINAL_RUNTIME="0"
+NFT_WANT_ENABLE=0
 
 # ---------- logging & common helpers ----------
 info() { printf '\033[32m[INFO]\033[0m %s\n' "$*"; }
@@ -115,10 +116,10 @@ show_persistence_hint() {
     fi
 }
 
-# 提示如何人工启用 nftables 开机加载；prefix 用于区分调用场景文案。
+# 提示如何启用 nftables 开机加载；prefix 用于区分调用场景文案。
 warn_nftables_service_not_enabled() {
     local prefix="${1:-}"
-    warn "${prefix}nftables.service 未开机自启；本脚本为避免清空其它防火墙，不会自动启用/启动它。"
+    warn "${prefix}nftables.service 未开机自启；添加规则时可选择启用（默认否）。"
     warn "请先确认本机以 nftables 为唯一防火墙（勿与 firewalld/ufw/iptables 抢接管），再执行："
     warn "  systemctl enable --now nftables"
     warn "可选检查：systemctl status nftables && nft list ruleset"
@@ -941,6 +942,38 @@ plan_ip_forward_for_add() {
     fi
 }
 
+plan_nftables_enable_for_add() {
+    local ans
+    NFT_WANT_ENABLE=0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl is-enabled --quiet nftables 2>/dev/null; then
+        return 0
+    fi
+    read_or_cancel ans "是否启用 nftables.service（systemctl enable --now）？[y/N]: " || return 1
+    answer_yes_default_no "$ans" && NFT_WANT_ENABLE=1
+    return 0
+}
+
+enable_nftables_service() {
+    warn "将执行 systemctl enable --now nftables；请确认本机以 nftables 为唯一防火墙。"
+    if ! main_conf_has_include; then
+        warn "${MAIN_CONF} 尚未 include ${INCLUDE_GLOB}；启动后可能无法加载本脚本规则（可用菜单 4 修复）。"
+    fi
+    systemctl enable --now nftables || {
+        err "启用/启动 nftables.service 失败。"
+        return 1
+    }
+    info "nftables.service 已启用并启动。"
+    nftables_service_uses_main_conf \
+        || warn "nftables.service 未明确引用 ${MAIN_CONF}；请人工核对开机加载入口。"
+    return 0
+}
+
+apply_nftables_enable_plan() {
+    (( NFT_WANT_ENABLE )) || return 0
+    enable_nftables_service
+}
+
 apply_ip_forward_plan() {
     if (( IPF_WANT_ENABLE )); then
         enable_ip_forward_runtime || {
@@ -1124,7 +1157,7 @@ show_tips() {
    输入目标后会做一次 TCP 连通探测；不通可确认后仍继续。
 3. 删除时按列表序号；可用空格或逗号多选（如 1 3 5 或 1,3,5）；
    也支持 n+（第 n 与 n+1 条）、n-（第 n 与 n-1 条）；越界邻居会跳过并警告；输入 all 可清空。
-4. 菜单 4 可检查/修复 include 与 ip_forward；不会自动启动通用 nftables.service。
+4. 菜单 4 可检查/修复 include 与 ip_forward；添加规则时可选择启用 nftables.service（默认否）。
    --check 只做运行态/持久化校验，不对目标做网络探测。
 
 安全边界：
@@ -1204,7 +1237,8 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION}
     运行态 table ${TABLE_FAMILY} ${TABLE_NAME}
         以及可选的 net.ipv4.ip_forward=1（内核，非文件）
 
-不会自动改动: firewalld / ufw / iptables、nftables.service 开机状态、BBR；
+不会自动改动: firewalld / ufw / iptables、BBR；
+添加规则时可选择启用 nftables.service（默认否）。
 也不会写操作日志或无限累积 portfwd.conf 备份。
 EOF
 }
@@ -1604,6 +1638,7 @@ add_rule_interactive() {
     }
 
     plan_ip_forward_for_add || return 0
+    plan_nftables_enable_for_add || return 0
     old_rules=("${RULES[@]+"${RULES[@]}"}")
     for p in "${protos_to_add[@]}"; do
         RULES+=("${listen_ip}|${lport}|${p}|${dip}|${dport}|${iif}|${source_cidr}")
@@ -1619,6 +1654,9 @@ add_rule_interactive() {
         RULES=("${old_rules[@]+"${old_rules[@]}"}")
         commit_rules || die "撤销规则失败，请立即检查 ${CONF_FILE} 与运行表。"
         return 1
+    fi
+    if ! apply_nftables_enable_plan; then
+        err "规则已提交，但启用 nftables.service 失败；可稍后手动执行 systemctl enable --now nftables。"
     fi
 
     info "规则添加成功。"

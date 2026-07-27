@@ -200,12 +200,35 @@ expect_ok finish_health_check 0 0 strict >/dev/null 2>&1
 CLI_MODE="menu"
 expect_ok handle_cli_args --check-strict
 [[ "$CLI_MODE" == "check-strict" ]] || fail '--check-strict did not select strict mode'
-[[ "$SCRIPT_VERSION" == "2.2.2" ]] || fail 'unexpected script version'
+[[ "$SCRIPT_VERSION" == "2.2.3" ]] || fail 'unexpected script version'
 help_out="$(print_help)"
 grep -Fq "$CONF_FILE" <<< "$help_out" || fail 'help omitted managed conf path'
 grep -Fq "$SYSCTL_FILE" <<< "$help_out" || fail 'help omitted sysctl path'
 grep -Fq "$TXN_MARKER" <<< "$help_out" || fail 'help omitted transaction marker path'
 grep -Fq '不会自动改动' <<< "$help_out" || fail 'help omitted non-touch summary'
+grep -Fq '添加规则时可选择启用 nftables.service' <<< "$help_out" \
+    || fail 'help omitted optional nftables enable note'
+
+systemctl() {
+    [[ "$1" == "is-enabled" ]] && return 1
+    return 0
+}
+read_or_cancel() { printf -v "$1" '%s' ''; }
+NFT_WANT_ENABLE=1
+expect_ok plan_nftables_enable_for_add
+[[ "$NFT_WANT_ENABLE" == "0" ]] || fail 'empty answer should leave nftables enable off'
+read_or_cancel() { printf -v "$1" '%s' 'y'; }
+expect_ok plan_nftables_enable_for_add
+[[ "$NFT_WANT_ENABLE" == "1" ]] || fail 'y should request nftables enable'
+systemctl() {
+    [[ "$1" == "is-enabled" ]] && return 0
+    return 0
+}
+NFT_WANT_ENABLE=1
+expect_ok plan_nftables_enable_for_add
+[[ "$NFT_WANT_ENABLE" == "0" ]] || fail 'already-enabled nftables should skip prompt'
+unset -f systemctl read_or_cancel
+NFT_WANT_ENABLE=0
 
 del_idxs=()
 expect_ok parse_rule_delete_selection '1,3 5' 5 del_idxs
