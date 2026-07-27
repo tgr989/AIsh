@@ -6,7 +6,7 @@ umask 077
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly XRAY_CONFIG_DIR="/usr/local/etc/xray"
 readonly SERVER_CONFIG="${XRAY_CONFIG_DIR}/config.json"
-readonly DEPLOY_DIR="/root/xray-dual"
+readonly DEPLOY_DIR="/root/xray"
 readonly INSTALLER_REPO="XTLS/Xray-install"
 readonly INSTALLER_REF="${INSTALLER_REF:-main}"
 readonly INSTALLER_API="https://api.github.com/repos/${INSTALLER_REPO}"
