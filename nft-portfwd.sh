@@ -19,7 +19,7 @@ TABLE_NAME="portfwd"
 CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
-SCRIPT_VERSION="2.2.3"
+SCRIPT_VERSION="2.2.4"
 
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/portfwd.conf"
@@ -967,6 +967,82 @@ enable_nftables_service() {
     nftables_service_uses_main_conf \
         || warn "nftables.service 未明确引用 ${MAIN_CONF}；请人工核对开机加载入口。"
     return 0
+}
+
+restart_or_enable_nftables_service() {
+    command -v systemctl >/dev/null 2>&1 || {
+        err "未发现 systemctl，无法启用/重启 nftables.service。"
+        return 1
+    }
+    if systemctl is-enabled --quiet nftables 2>/dev/null; then
+        warn "将执行 systemctl restart nftables；请确认本机以 nftables 为唯一防火墙。"
+        if ! main_conf_has_include; then
+            warn "${MAIN_CONF} 尚未 include ${INCLUDE_GLOB}；重启后可能无法加载本脚本规则（可用菜单 4 修复）。"
+        fi
+        systemctl restart nftables || {
+            err "重启 nftables.service 失败。"
+            return 1
+        }
+        info "nftables.service 已重启。"
+        nftables_service_uses_main_conf \
+            || warn "nftables.service 未明确引用 ${MAIN_CONF}；请人工核对开机加载入口。"
+        return 0
+    fi
+    enable_nftables_service
+}
+
+# 统计运行态 prerouting 中的 DNAT 条数；表/链不存在时输出 0 并返回失败。
+count_runtime_dnat_rules() {
+    local output line n=0
+    if ! output="$(nft -nn list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_PREROUTING" 2>/dev/null)"; then
+        printf '%s\n' 0
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *" dnat to "* ]] && (( ++n ))
+    done <<< "$output"
+    printf '%s\n' "$n"
+    return 0
+}
+
+# 配置有规则，但 nftables 未启用/未运行，或运行态 DNAT 数量与配置不一致时，提示启用或重启（默认 Y）。
+maybe_prompt_nftables_enable_or_restart() {
+    local ans conf_count runtime_count=0
+    local -a reasons=()
+
+    conf_count="${#RULES[@]}"
+    (( conf_count > 0 )) || return 0
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl is-enabled --quiet nftables 2>/dev/null; then
+            reasons+=("nftables.service 未开机自启")
+        fi
+        if ! systemctl is-active --quiet nftables 2>/dev/null; then
+            reasons+=("nftables.service 未运行")
+        fi
+    fi
+
+    if ! runtime_count="$(count_runtime_dnat_rules)"; then
+        runtime_count=0
+        reasons+=("运行表缺失或不可读（配置 ${conf_count} 条）")
+    elif (( runtime_count != conf_count )); then
+        reasons+=("规则数量不一致：配置 ${conf_count} 条，运行态 DNAT ${runtime_count} 条")
+    fi
+
+    (( ${#reasons[@]} > 0 )) || return 0
+
+    echo
+    warn "检测到配置有规则，但 nftables 状态异常："
+    local r
+    for r in "${reasons[@]}"; do
+        warn "  - ${r}"
+    done
+    read_or_cancel ans "是否启用/重启 nftables.service？[Y/n]: " || return 0
+    answer_yes_default_yes "$ans" || {
+        warn "已跳过启用/重启 nftables.service。"
+        return 0
+    }
+    restart_or_enable_nftables_service
 }
 
 apply_nftables_enable_plan() {
@@ -1948,6 +2024,7 @@ check_and_fix_environment_interactive() {
 view_rules_interactive() {
     echo
     list_rules || return 1
+    maybe_prompt_nftables_enable_or_restart || warn "启用/重启 nftables.service 未成功。"
     local ans
     read_or_cancel ans "显示原始 nft 规则？[y/N]: " || return 0
     if answer_yes_default_no "$ans"; then

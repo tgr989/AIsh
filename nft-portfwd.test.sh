@@ -200,7 +200,7 @@ expect_ok finish_health_check 0 0 strict >/dev/null 2>&1
 CLI_MODE="menu"
 expect_ok handle_cli_args --check-strict
 [[ "$CLI_MODE" == "check-strict" ]] || fail '--check-strict did not select strict mode'
-[[ "$SCRIPT_VERSION" == "2.2.3" ]] || fail 'unexpected script version'
+[[ "$SCRIPT_VERSION" == "2.2.4" ]] || fail 'unexpected script version'
 help_out="$(print_help)"
 grep -Fq "$CONF_FILE" <<< "$help_out" || fail 'help omitted managed conf path'
 grep -Fq "$SYSCTL_FILE" <<< "$help_out" || fail 'help omitted sysctl path'
@@ -229,6 +229,74 @@ expect_ok plan_nftables_enable_for_add
 [[ "$NFT_WANT_ENABLE" == "0" ]] || fail 'already-enabled nftables should skip prompt'
 unset -f systemctl read_or_cancel
 NFT_WANT_ENABLE=0
+
+nft() {
+    [[ "$1" == "-nn" && "$2" == "list" && "$3" == "chain" ]] || return 1
+    printf '%s\n' \
+        'type nat hook prerouting priority dstnat; policy accept;' \
+        'ip daddr 192.0.2.10 tcp dport 8443 dnat to 10.0.0.2:443' \
+        'ip daddr 192.0.2.10 udp dport 8443 dnat to 10.0.0.2:443'
+}
+[[ "$(count_runtime_dnat_rules)" == "2" ]] || fail 'count_runtime_dnat_rules should count DNAT lines'
+nft() { return 1; }
+[[ "$(count_runtime_dnat_rules)" == "0" ]] || fail 'missing runtime chain should count as 0'
+expect_fail count_runtime_dnat_rules >/dev/null
+
+RULES=("192.0.2.10|8443|tcp|10.0.0.2|443|*|0.0.0.0/0")
+main_conf_has_include() { return 0; }
+nftables_service_uses_main_conf() { return 0; }
+nft() {
+    [[ "$1" == "-nn" && "$2" == "list" && "$3" == "chain" ]] || return 1
+    printf '%s\n' 'ip daddr 192.0.2.10 tcp dport 8443 dnat to 10.0.0.2:443'
+}
+systemctl() {
+    case "$1" in
+        is-enabled|is-active) return 0 ;;
+        *) return 0 ;;
+    esac
+}
+prompted=0
+read_or_cancel() { prompted=1; printf -v "$1" '%s' 'n'; }
+expect_ok maybe_prompt_nftables_enable_or_restart >/dev/null
+[[ "$prompted" == "0" ]] || fail 'matching enabled/active runtime should not prompt'
+
+nft() {
+    [[ "$1" == "-nn" && "$2" == "list" && "$3" == "chain" ]] || return 1
+    printf '%s\n' 'type nat hook prerouting priority dstnat; policy accept;'
+}
+prompted=0
+restart_called=0
+read_or_cancel() { prompted=1; printf -v "$1" '%s' ''; }
+systemctl() {
+    case "$1" in
+        is-enabled|is-active) return 0 ;;
+        restart) restart_called=1; return 0 ;;
+        *) return 0 ;;
+    esac
+}
+expect_ok maybe_prompt_nftables_enable_or_restart >/dev/null
+[[ "$prompted" == "1" ]] || fail 'count mismatch should prompt enable/restart'
+[[ "$restart_called" == "1" ]] || fail 'default Y should restart enabled nftables'
+
+enable_called=0
+systemctl() {
+    case "$1" in
+        is-enabled|is-active) return 1 ;;
+        enable) enable_called=1; return 0 ;;
+        *) return 0 ;;
+    esac
+}
+nft() {
+    [[ "$1" == "-nn" && "$2" == "list" && "$3" == "chain" ]] || return 1
+    printf '%s\n' 'ip daddr 192.0.2.10 tcp dport 8443 dnat to 10.0.0.2:443'
+}
+prompted=0
+read_or_cancel() { prompted=1; printf -v "$1" '%s' 'n'; }
+expect_ok maybe_prompt_nftables_enable_or_restart >/dev/null
+[[ "$prompted" == "1" ]] || fail 'disabled nftables should prompt even when counts match'
+[[ "$enable_called" == "0" ]] || fail 'answering n should skip enable/restart'
+unset -f nft systemctl read_or_cancel main_conf_has_include nftables_service_uses_main_conf
+RULES=()
 
 del_idxs=()
 expect_ok parse_rule_delete_selection '1,3 5' 5 del_idxs
