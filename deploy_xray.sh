@@ -43,7 +43,7 @@ usage() {
   SERVER_ADDRESS       客户端连接的服务器 IP 或域名（默认自动探测；失败时必填）
   VLESS_PORT           VLESS-TCP-REALITY 端口（默认 443，可输入 random 或 r）
   SS_PORT              Shadowsocks 2022 端口（无默认，必须输入或使用 random/r）
-  REALITY_SERVER_NAME  REALITY 伪装域名/SNI（默认 yahoo.co.jp）
+  REALITY_SERVER_NAME  REALITY 伪装域名/SNI（默认 speed.cloudflare.com）
   REALITY_TARGET_PORT  伪装站 TLS 端口（默认 443）
   FALLBACK_PORT        本机防偷跑中转端口（默认 2443，可输入 random 或 r）
   SS_METHOD            SS2022 方法（默认 2022-blake3-aes-128-gcm）
@@ -484,7 +484,7 @@ if mode_has_vless; then
   select_local_port VLESS_PORT "VLESS 监听端口" "${VLESS_PORT:-443}"
   select_local_port FALLBACK_PORT "本机 fallback 端口" "${FALLBACK_PORT:-2443}"
   prompt_value REALITY_SERVER_NAME "REALITY 伪装域名/SNI" \
-    "${REALITY_SERVER_NAME:-yahoo.co.jp}"
+    "${REALITY_SERVER_NAME:-speed.cloudflare.com}"
   prompt_value REALITY_TARGET_PORT "REALITY 目标 TLS 端口" \
     "${REALITY_TARGET_PORT:-443}"
 fi
