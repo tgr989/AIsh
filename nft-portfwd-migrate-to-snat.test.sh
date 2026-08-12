@@ -58,6 +58,30 @@ grep -Fqx 'define LOCAL_IP = 198.51.100.10' "$new_empty_conf" \
     || fail 'empty config migration lost LOCAL_IP'
 expect_fail grep -Eq '^[[:space:]]*#[[:space:]]*RULE:' "$new_empty_conf"
 
+nft() {
+    case "$*" in
+        "--version")
+            printf '%s\n' 'nftables test version'
+            ;;
+        "-nn list table ip portfwd")
+            printf '%s\n' 'table ip portfwd {' '    chain unexpected {' '    }' '}'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+export -f nft
+if verify_error="$(verify_snat_runtime "$new_conf" 2>&1)"; then
+    fail 'runtime verification unexpectedly accepted a mismatched table'
+fi
+[[ "$verify_error" == *'[ERR ] SNAT 运行态与候选配置不一致。'* ]] \
+    || fail 'runtime mismatch diagnostic was not emitted'
+[[ "$verify_error" != *"return: can only \`return'"* ]] \
+    || fail 'runtime mismatch used return outside a function'
+export -n -f nft
+unset -f nft
+
 source_identity="$(bash -s -- "${SCRIPT_DIR}/nft-portfwd.sh" <<'BASH'
 source "$1"
 printf '%s|' "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_PREROUTING" "$CHAIN_POSTROUTING" \

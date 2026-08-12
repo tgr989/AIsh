@@ -222,7 +222,7 @@ if ! runtime_rules_match_loaded_config "$runtime_output"; then
     printf '%s\n' "[ERR ] nftables 版本：$(nft --version 2>/dev/null || printf 'unknown')" >&2
     printf '%s\n' '[ERR ] 规范化后的运行态如下：' >&2
     printf '%s\n' "$runtime_output" >&2
-    return 1
+    exit 1
 fi
 BASH
 }
