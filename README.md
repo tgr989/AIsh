@@ -44,7 +44,7 @@ sudo ./nft-portfwd.sh
 - Does not auto-modify firewalld / ufw / iptables.
 - Uses nftables as the sole firewall manager for these forwarding rules; no secondary firewall integration is included.
 - This script manages NAT only. Existing filter/FORWARD policies, host firewalls, cloud security groups and upstream ACLs can still block forwarded traffic.
-- Does not enable, start, reload, or stop the generic `nftables.service`; choose one firewall owner and verify service ordering yourself.
+- After adding a rule, optionally offers `systemctl enable --now nftables` (default no). It does not otherwise start/reload/stop the generic `nftables.service`; choose one firewall owner and verify service ordering yourself.
 - Persisted loading depends on `/etc/nftables.conf` including `"/etc/nftables.d/*.conf"`.
 - Reloads are idempotent and atomically delete/recreate only the owned `table ip portfwd`; an ownership sentinel prevents taking over an unrelated table with the same name.
 - Health checks compare the complete runtime chain/rule expressions with the managed configuration and reject unsafe config ownership or permissions.
