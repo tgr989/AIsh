@@ -9,7 +9,7 @@ umask 027
 # nftables 端口转发管理脚本（nft-portfwd-snat）
 #
 # - 管理独立表 table ip portfwd
-# - DNAT + 静态 SNAT（SNAT 地址为每条规则的监听 IPv4）
+# - DNAT + 静态 SNAT（SNAT 地址为本机默认路由出口 IPv4）
 # - 协议 tcp/udp（可同时添加，默认 both）
 # - 检查/持久化 ip_forward 与 nftables include
 #
@@ -20,6 +20,7 @@ CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
 SCRIPT_VERSION="2.2.4"
+SCRIPT_BASENAME="${BASH_SOURCE[0]##*/}"
 
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/portfwd.conf"
@@ -38,6 +39,7 @@ INCLUDE_LINE="include \"${INCLUDE_GLOB}\""
 INCLUDE_CHECK_REGEX="^[[:space:]]*include[[:space:]]+[\"']?/etc/nftables\\.d/\\*\\.conf[\"']?([[:space:]]*;)?[[:space:]]*$"
 
 readonly TABLE_FAMILY TABLE_NAME CHAIN_PREROUTING CHAIN_POSTROUTING SCRIPT_DISPLAY_NAME SCRIPT_VERSION
+readonly SCRIPT_BASENAME
 readonly CONF_DIR CONF_FILE MAIN_CONF SYSCTL_FILE
 readonly RUNTIME_DIR LOCK_FILE OWNER_CHAIN
 readonly TXN_CANDIDATE TXN_ROLLBACK TXN_MARKER
@@ -50,6 +52,7 @@ readonly INCLUDE_GLOB INCLUDE_LINE INCLUDE_CHECK_REGEX
 # iif 为入口网卡名（如 eth0）或 *（不限制）
 # source_cidr 默认为 0.0.0.0/0
 declare -a RULES=()
+SNAT_IP=""
 LOCK_FD=""
 CONFIG_LOAD_ERRORS=0
 CLI_MODE="menu"
@@ -266,6 +269,62 @@ ipv4_is_rfc1918() {
     return 1
 }
 
+# 优先使用默认路由实际选择的源 IPv4；
+# 无默认路由时，回退到第一个非 lo 的全局 IPv4。
+get_local_ip() {
+    local route token want_src=0 ip_addr=""
+    local _idx _if _fam cidr _rest
+
+    if IFS= read -r route < <(ip -4 route get 1.1.1.1 2>/dev/null); then
+        for token in $route; do
+            if (( want_src )); then
+                ip_addr="$token"
+                break
+            fi
+            [[ "$token" == "src" ]] && want_src=1
+        done
+        if validate_ipv4 "$ip_addr"; then
+            printf '%s\n' "$ip_addr"
+            return 0
+        fi
+    fi
+
+    while read -r _idx _if _fam cidr _rest; do
+        [[ "$_if" == "lo" ]] && continue
+        ip_addr="${cidr%/*}"
+        if validate_ipv4 "$ip_addr"; then
+            printf '%s\n' "$ip_addr"
+            return 0
+        fi
+    done < <(ip -o -4 addr show scope global 2>/dev/null || true)
+
+    return 1
+}
+
+refresh_snat_ip() {
+    local detected
+    detected="$(get_local_ip)" || {
+        err "无法获取本机默认路由出口 IPv4，不能生成静态 SNAT 配置。"
+        return 1
+    }
+    validate_ipv4 "$detected" || return 1
+    SNAT_IP="$detected"
+}
+
+check_snat_ip_current() {
+    local detected
+    if ! detected="$(get_local_ip)"; then
+        err "无法获取当前默认路由出口 IPv4，不能核对配置中的 LOCAL_IP。"
+        return 2
+    fi
+    if [[ "$SNAT_IP" != "$detected" ]]; then
+        err "配置 LOCAL_IP=${SNAT_IP}，当前默认路由出口 IPv4=${detected}。"
+        err "请使用菜单 4 检查并修复环境，重新提交现有规则。"
+        return 1
+    fi
+    info "SNAT LOCAL_IP 与当前默认路由出口 IPv4 一致：${SNAT_IP}"
+}
+
 # ss 监听行是否包含指定端口（避免 :80 误匹配 :8080）。
 ss_listen_line_has_port() {
     local port="$1" line="$2"
@@ -446,9 +505,10 @@ rule_conflicts() {
 load_rules_from_conf() {
     local conf_path="${1:-$CONF_FILE}"
     local line parsed_rule listen_ip lport proto dip dport iif source_cidr
-    local tmp_expected=""
+    local tmp_expected="" snat_ip_count=0
     local -a fields=()
     RULES=()
+    SNAT_IP=""
     CONFIG_LOAD_ERRORS=0
 
     [[ ! -L "$conf_path" ]] || {
@@ -469,6 +529,15 @@ load_rules_from_conf() {
     }
 
     while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*define[[:space:]]+LOCAL_IP[[:space:]]*=[[:space:]]*([0-9.]+)[[:space:]]*$ ]]; then
+            (( ++snat_ip_count ))
+            SNAT_IP="${BASH_REMATCH[1]}"
+            validate_ipv4 "$SNAT_IP" || {
+                err "配置中的 LOCAL_IP 非法：${SNAT_IP}"
+                CONFIG_LOAD_ERRORS=1
+            }
+            continue
+        fi
         if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*RULE:[[:space:]]*(.+)[[:space:]]*$ ]]; then
             parsed_rule="${BASH_REMATCH[1]}"
             fields=()
@@ -506,6 +575,11 @@ load_rules_from_conf() {
         fi
     done < "$conf_path"
 
+    if (( snat_ip_count != 1 )); then
+        err "配置必须恰好包含一条 define LOCAL_IP（当前 ${snat_ip_count} 条）。"
+        CONFIG_LOAD_ERRORS=1
+    fi
+
     if (( CONFIG_LOAD_ERRORS == 0 )); then
         tmp_expected="$(mktemp)" || {
             err "无法创建配置一致性检查临时文件。"
@@ -534,9 +608,15 @@ render_conf_file() {
     local r listen_ip lport proto dip dport iif source_cidr
     local iif_expr source_expr original_source_expr
 
+    validate_ipv4 "$SNAT_IP" || {
+        err "未设置合法的 SNAT LOCAL_IP，拒绝生成配置。"
+        return 1
+    }
+
     if ! {
         printf '%s\n' '#!/usr/sbin/nft -f'
         printf '%s\n\n' "$CONF_MAGIC"
+        printf 'define LOCAL_IP = %s\n\n' "$SNAT_IP"
         printf 'add table %s %s\n' "$TABLE_FAMILY" "$TABLE_NAME"
         printf 'delete table %s %s\n\n' "$TABLE_FAMILY" "$TABLE_NAME"
         printf 'table %s %s {\n' "$TABLE_FAMILY" "$TABLE_NAME"
@@ -570,8 +650,8 @@ render_conf_file() {
             printf '        # RULE-SNAT: %s\n' "$r"
             # proto-dst 需要先有 L4 协议上下文，否则部分 nft 版本会报
             # "Can't parse symbolic invalid expressions"。
-            printf '        %sct status dnat ct original ip daddr %s meta l4proto %s ct original proto-dst %s %sip daddr %s %s dport %s snat to %s\n' \
-                "$iif_expr" "$listen_ip" "$proto" "$lport" "$original_source_expr" "$dip" "$proto" "$dport" "$listen_ip"
+            printf '        %sct status dnat ct original ip daddr %s meta l4proto %s ct original proto-dst %s %sip daddr %s %s dport %s snat to $LOCAL_IP\n' \
+                "$iif_expr" "$listen_ip" "$proto" "$lport" "$original_source_expr" "$dip" "$proto" "$dport"
         done
 
         printf '    }\n'
@@ -602,11 +682,12 @@ runtime_rules_match_loaded_config() {
         original_source_expr=""
         [[ "$iif" == "*" ]] || iif_expr="iifname \"${iif}\" "
         [[ "$source_cidr" == "0.0.0.0/0" ]] || {
-            source_expr="ip saddr ${source_cidr} "
-            original_source_expr="ct original ip saddr ${source_cidr} "
+            # nft list 会将 a.b.c.d/32 显示为裸地址；%/32 仅移除该后缀。
+            source_expr="ip saddr ${source_cidr%/32} "
+            original_source_expr="ct original ip saddr ${source_cidr%/32} "
         }
         expected["${CHAIN_PREROUTING}|${iif_expr}ip daddr ${listen_ip} ${source_expr}${proto} dport ${lport} dnat to ${dip}:${dport}"]=1
-        expected["${CHAIN_POSTROUTING}|${iif_expr}ct status dnat ct original ip daddr ${listen_ip} meta l4proto ${proto} ct original proto-dst ${lport} ${original_source_expr}ip daddr ${dip} ${proto} dport ${dport} snat to ${listen_ip}"]=1
+        expected["${CHAIN_POSTROUTING}|${iif_expr}ct status dnat ct original ip daddr ${listen_ip} meta l4proto ${proto} ct original proto-dst ${lport} ${original_source_expr}ip daddr ${dip} ${proto} dport ${dport} snat to ${SNAT_IP}"]=1
     done
 
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -661,6 +742,9 @@ check_runtime_ownership() {
 normalize_runtime_nft_dump() {
     local line proto
     while IFS= read -r line || [[ -n "$line" ]]; do
+        # 某些 nft 版本会显式输出 NAT 地址族；在 table ip 中语义相同。
+        line="${line// dnat ip to / dnat to }"
+        line="${line// snat ip to / snat to }"
         if [[ "$line" == *"ct original proto-dst"* && "$line" != *"meta l4proto"* ]]; then
             if [[ "$line" =~ [[:space:]](tcp|udp)[[:space:]]+dport[[:space:]] ]]; then
                 proto="${BASH_REMATCH[1]}"
@@ -697,6 +781,11 @@ apply_nft_file() {
     run_nft -f "$nft_file"
 }
 
+cleanup_transaction_files() {
+    rm -f "$TXN_CANDIDATE" "$TXN_ROLLBACK" || return 1
+    rm -f "$TXN_MARKER"
+}
+
 recover_incomplete_transaction() {
     ensure_dirs
     if [[ ! -e "$TXN_MARKER" ]]; then
@@ -719,8 +808,7 @@ recover_incomplete_transaction() {
         info "已按已提交配置恢复运行态。"
     fi
 
-    rm -f "$TXN_MARKER" "$TXN_CANDIDATE" "$TXN_ROLLBACK" \
-        || die "无法清理已恢复的事务文件。"
+    cleanup_transaction_files || die "无法清理已恢复的事务文件。"
 }
 
 commit_rules() {
@@ -731,6 +819,7 @@ commit_rules() {
         return 1
     }
     check_runtime_ownership || return 1
+    refresh_snat_ip || return 1
 
     rm -f "$TXN_CANDIDATE" "$TXN_ROLLBACK" || return 1
     render_conf_file "$TXN_CANDIDATE" || return 1
@@ -749,14 +838,14 @@ commit_rules() {
 
     if ! run_nft -f "$TXN_CANDIDATE"; then
         err "加载候选规则失败；nft 原子事务未提交，磁盘配置保持不变。"
-        rm -f "$TXN_MARKER" "$TXN_CANDIDATE" "$TXN_ROLLBACK" || true
+        cleanup_transaction_files || true
         return 1
     fi
 
     if ! mv -f "$TXN_CANDIDATE" "$CONF_FILE"; then
         err "运行态已更新，但提交正式配置失败；正在回滚运行态。"
         if apply_nft_file "$TXN_ROLLBACK"; then
-            rm -f "$TXN_MARKER" "$TXN_CANDIDATE" "$TXN_ROLLBACK" || true
+            cleanup_transaction_files || true
             err "已恢复事务前运行态，磁盘配置未改变。"
         else
             err "运行态回滚失败，事务文件已保留，禁止继续操作。"
@@ -769,7 +858,7 @@ commit_rules() {
 }
 
 finish_committed_transaction() {
-    if ! rm -f "$TXN_MARKER" "$TXN_ROLLBACK"; then
+    if ! cleanup_transaction_files; then
         warn "规则已提交，但事务清理失败；下次启动会自动核对恢复。"
     fi
     return 0
@@ -1223,11 +1312,11 @@ check_forward_status() {
 show_tips() {
     cat <<EOF
 
-脚本: ${SCRIPT_DISPLAY_NAME}.sh
+脚本: ${SCRIPT_BASENAME}
 
 使用说明：
-1. 模式固定为 DNAT + 静态 SNAT；每条规则使用其监听 IPv4 作为 SNAT 地址（后端看不到真实客户端 IP）。
-   监听 IPv4 应是后端可回程到本机的稳定地址；若地址会动态变化，请使用原 MASQUERADE 版。
+1. 模式固定为 DNAT + 静态 SNAT；使用本机默认路由出口 IPv4 作为 LOCAL_IP。
+   配置写入 define LOCAL_IP，后端看不到真实客户端 IP；出口地址变化后可用菜单 4 检查并修复。
 2. 添加时必须明确监听 IPv4（可按序号选本机地址），并可限制来源 CIDR / 入口网卡。
    云厂商若公网 IP 未挂在网卡上，请选内网 IP（包到达本机时的目的地址）。
    若本机端口已被服务占用，会警告并请你确认。
@@ -1244,8 +1333,8 @@ show_tips() {
 
 常用命令：
   # 本脚本
-  sudo ./${SCRIPT_DISPLAY_NAME}.sh --check
-  sudo ./${SCRIPT_DISPLAY_NAME}.sh --check-strict
+  sudo ./${SCRIPT_BASENAME} --check
+  sudo ./${SCRIPT_BASENAME} --check-strict
 
   # 规则查看 / 校验
   nft list table ${TABLE_FAMILY} ${TABLE_NAME}
@@ -1273,14 +1362,14 @@ EOF
 
 print_help() {
     cat <<EOF
-${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION}
+${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION} (static-snat)
 
 用法:
-    sudo ./${SCRIPT_DISPLAY_NAME}.sh
-    ./${SCRIPT_DISPLAY_NAME}.sh --help
-    ./${SCRIPT_DISPLAY_NAME}.sh --version
-    ./${SCRIPT_DISPLAY_NAME}.sh --check
-    ./${SCRIPT_DISPLAY_NAME}.sh --check-strict
+    sudo ./${SCRIPT_BASENAME}
+    ./${SCRIPT_BASENAME} --help
+    ./${SCRIPT_BASENAME} --version
+    ./${SCRIPT_BASENAME} --check
+    ./${SCRIPT_BASENAME} --check-strict
 
 参数:
     -h, --help       显示帮助并退出
@@ -1354,6 +1443,7 @@ run_health_check() {
     fi
 
     if (( config_ok && ${#RULES[@]} > 0 )); then
+        check_snat_ip_current || status=1
         if ! ipf="$(get_ip_forward_value)"; then
             err "无法读取 net.ipv4.ip_forward"
             status=1
@@ -1451,7 +1541,7 @@ handle_cli_args() {
             exit 0
             ;;
         -v|--version)
-            echo "${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION}"
+            echo "${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION} (static-snat)"
             exit 0
             ;;
         -c|--check)
@@ -1705,7 +1795,7 @@ add_rule_interactive() {
     echo
     info "将添加规则（DNAT + SNAT）:"
     for p in "${protos_to_add[@]}"; do
-        echo "  ${p} ${listen_ip}:${lport} -> ${dip}:${dport} (snat=${listen_ip}, iif=${iif}, source=${source_cidr})"
+        echo "  ${p} ${listen_ip}:${lport} -> ${dip}:${dport} (snat=本机出口IP, iif=${iif}, source=${source_cidr})"
     done
 
     read_or_cancel ans "确认继续? [y/N]: " || return 0
@@ -1949,6 +2039,7 @@ environment_needs_attention() {
     load_rules_from_conf >/dev/null 2>&1 || return 0
     (( CONFIG_LOAD_ERRORS == 0 )) || return 0
     if (( ${#RULES[@]} > 0 )); then
+        check_snat_ip_current >/dev/null 2>&1 || return 0
         ipf="$(get_ip_forward_value)" || return 0
         [[ "$ipf" != "1" ]] && return 0
     fi
@@ -1971,7 +2062,7 @@ maybe_first_run_setup() {
 }
 
 setup_environment_interactive() {
-    local cur ans
+    local cur ans snat_check_rc
 
     info "检查并修复：配置文件、持久化 include、IPv4 转发；不会自动启动通用 nftables.service。"
     init_empty_conf_if_needed || return 1
@@ -1980,6 +2071,20 @@ setup_environment_interactive() {
     if (( ${#RULES[@]} == 0 )); then
         info "当前没有转发规则，不需要开启 IPv4 forwarding。"
         return 0
+    fi
+
+    if check_snat_ip_current; then
+        :
+    else
+        snat_check_rc=$?
+        (( snat_check_rc == 1 )) || return 1
+        read_or_cancel ans "是否以当前出口 IPv4 重新提交现有规则？[Y/n]: " || return 0
+        if answer_yes_default_yes "$ans"; then
+            commit_rules || return 1
+            info "已更新 LOCAL_IP 并重新提交现有规则。"
+        else
+            warn "已跳过更新 LOCAL_IP；现有静态 SNAT 可能无法正常转发。"
+        fi
     fi
 
     cur="$(get_ip_forward_value)" || {

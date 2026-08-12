@@ -38,7 +38,8 @@ print_help() {
 
 作用:
   将 ${CONF_FILE} 从 DNAT + MASQUERADE 原位迁移为 DNAT + 静态 SNAT。
-  每条规则使用其监听 IPv4 作为 SNAT 地址，表名、配置路径及规则元数据保持不变。
+  自动探测默认路由出口 IPv4 并写为 define LOCAL_IP；
+  表名、配置路径及规则元数据保持不变。
 
 要求:
   ${SOURCE_SCRIPT}
@@ -66,7 +67,7 @@ check_root() {
 
 check_requirements() {
     local cmd
-    local -a required=(bash nft flock install stat grep mktemp chmod cp mv rm)
+    local -a required=(bash nft flock install stat grep mktemp chmod cp mv rm head sed)
     for cmd in "${required[@]}"; do
         command -v "$cmd" >/dev/null 2>&1 || die "缺少必需命令：${cmd}"
     done
@@ -142,6 +143,11 @@ run_nft_file() {
     nft -c -f "$path" && nft -f "$path"
 }
 
+cleanup_transaction_files() {
+    rm -f "$TXN_CANDIDATE" "$TXN_ROLLBACK" || return 1
+    rm -f "$TXN_MARKER"
+}
+
 recover_transaction_if_needed() {
     [[ -e "$TXN_MARKER" ]] || {
         [[ ! -e "$TXN_CANDIDATE" && ! -e "$TXN_ROLLBACK" ]] \
@@ -159,8 +165,7 @@ recover_transaction_if_needed() {
         run_nft_file "$CONF_FILE" || die "无法按已提交配置恢复运行态；事务文件已保留。"
         info "已按已提交配置恢复运行态。"
     fi
-    rm -f "$TXN_MARKER" "$TXN_CANDIDATE" "$TXN_ROLLBACK" \
-        || die "无法清理已恢复的事务文件。"
+    cleanup_transaction_files || die "无法清理已恢复的事务文件。"
 }
 
 validate_config_with() {
@@ -173,8 +178,8 @@ BASH
 }
 
 render_snat_candidate() {
-    local old_conf="$1" output_path="$2"
-    bash -s -- "$TARGET_SCRIPT" "$old_conf" "$output_path" <<'BASH'
+    local old_conf="$1" output_path="$2" snat_ip_override="${3:-}"
+    bash -s -- "$TARGET_SCRIPT" "$old_conf" "$output_path" "$snat_ip_override" <<'BASH'
 set -euo pipefail
 source "$1"
 RULES=()
@@ -184,6 +189,12 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     fi
 done < "$2"
 CONFIG_LOAD_ERRORS=0
+if [[ -n "$4" ]]; then
+    validate_ipv4 "$4"
+    SNAT_IP="$4"
+else
+    refresh_snat_ip
+fi
 render_conf_file "$3"
 BASH
 }
@@ -206,14 +217,20 @@ source "$1"
 load_rules_from_conf "$2"
 runtime_output="$(nft -nn list table "$TABLE_FAMILY" "$TABLE_NAME")"
 runtime_output="$(normalize_runtime_nft_dump <<< "$runtime_output")"
-runtime_rules_match_loaded_config "$runtime_output"
+if ! runtime_rules_match_loaded_config "$runtime_output"; then
+    printf '%s\n' "[ERR ] SNAT 运行态与候选配置不一致。" >&2
+    printf '%s\n' "[ERR ] nftables 版本：$(nft --version 2>/dev/null || printf 'unknown')" >&2
+    printf '%s\n' '[ERR ] 规范化后的运行态如下：' >&2
+    printf '%s\n' "$runtime_output" >&2
+    return 1
+fi
 BASH
 }
 
 rollback_failed_migration() {
     err "迁移未完成，正在恢复原运行态。"
     if run_nft_file "$TXN_ROLLBACK"; then
-        rm -f "$TXN_MARKER" "$TXN_CANDIDATE" "$TXN_ROLLBACK" || true
+        cleanup_transaction_files || true
         info "已恢复原 MASQUERADE 运行态；磁盘配置未改变。"
     else
         err "自动回滚失败；已保留事务文件，请勿继续修改 nftables。"
@@ -225,7 +242,8 @@ confirm_migration() {
     local answer
     (( ASSUME_YES == 1 )) && return 0
     printf '\n将原位更新 %s 及运行中的 table ip portfwd。\n' "$CONF_FILE"
-    printf '旧配置备份会永久保留；迁移后请使用 nft-portfwd-snat.sh。\n'
+    printf '将自动使用本机默认路由出口 IPv4 作为 LOCAL_IP；旧配置备份会永久保留。\n'
+    printf '迁移后请使用 nft-portfwd-snat.sh。\n'
     read -rp "确认从 MASQUERADE 迁移到静态 SNAT？[y/N]: " answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]]
 }
@@ -244,19 +262,19 @@ main() {
     recover_transaction_if_needed
 
     if validate_config_with "$TARGET_SCRIPT" "$CONF_FILE" >/dev/null 2>&1; then
-        info "配置已经是 SNAT 版（空配置也无需迁移）。"
+        info "配置已经是 SNAT 版，无需迁移。"
         exit 0
     fi
     validate_config_with "$SOURCE_SCRIPT" "$CONF_FILE" \
         || die "旧配置未通过原 MASQUERADE 版的完整性校验，拒绝迁移。"
 
     rule_count="$(grep -Ec '^[[:space:]]*#[[:space:]]*RULE:' "$CONF_FILE" || true)"
-    (( rule_count > 0 )) || die "旧配置没有可迁移规则。"
     confirm_migration || { warn "已取消。"; exit 0; }
 
     OWNED_ARTIFACTS=1
     render_snat_candidate "$CONF_FILE" "$TXN_CANDIDATE" \
         || die "无法生成 SNAT 候选配置。"
+    info "检测到 SNAT LOCAL_IP：$(grep -E '^[[:space:]]*define[[:space:]]+LOCAL_IP' "$TXN_CANDIDATE" | head -n 1 | sed -E 's/.*=[[:space:]]*//')"
     chmod 0640 "$TXN_CANDIDATE" || die "无法设置候选配置权限。"
     validate_config_with "$TARGET_SCRIPT" "$TXN_CANDIDATE" \
         || die "SNAT 候选配置未通过完整性校验。"
@@ -270,7 +288,13 @@ main() {
     install -m 0600 -o root -g root /dev/null "$TXN_MARKER" \
         || die "无法创建事务标记。"
 
-    if ! nft -f "$TXN_CANDIDATE" || ! verify_snat_runtime "$TXN_CANDIDATE"; then
+    if ! nft -f "$TXN_CANDIDATE"; then
+        err "加载 SNAT 候选配置失败。"
+        rollback_failed_migration
+        exit 1
+    fi
+    if ! verify_snat_runtime "$TXN_CANDIDATE"; then
+        err "SNAT 候选配置已加载，但运行态一致性校验失败。"
         rollback_failed_migration
         exit 1
     fi
@@ -279,7 +303,7 @@ main() {
         exit 1
     fi
 
-    rm -f "$TXN_MARKER" "$TXN_ROLLBACK" \
+    cleanup_transaction_files \
         || warn "迁移已提交，但事务文件清理失败；下次运行会自动恢复一致状态。"
     OWNED_ARTIFACTS=0
 
