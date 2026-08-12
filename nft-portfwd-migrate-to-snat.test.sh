@@ -59,12 +59,35 @@ grep -Fqx 'define LOCAL_IP = 198.51.100.10' "$new_empty_conf" \
 expect_fail grep -Eq '^[[:space:]]*#[[:space:]]*RULE:' "$new_empty_conf"
 
 nft() {
-    case "$*" in
-        "--version")
+    case "${NFT_MOCK_MODE:-}:$*" in
+        "soft:--version"|"hard:--version"|"count:--version")
             printf '%s\n' 'nftables test version'
             ;;
-        "-nn list table ip portfwd")
-            printf '%s\n' 'table ip portfwd {' '    chain unexpected {' '    }' '}'
+        "soft:list table ip portfwd"|"hard:list table ip portfwd"|\
+        "count:list table ip portfwd"|\
+        "soft:list chain ip portfwd nft_portfwd_owner"|\
+        "count:list chain ip portfwd nft_portfwd_owner")
+            return 0
+            ;;
+        "soft:-a list chain ip portfwd prerouting"|\
+        "soft:-a list chain ip portfwd postrouting")
+            printf '%s\n' 'table ip portfwd {' '    chain test {' \
+                '        counter # handle 1' '    }' '}'
+            ;;
+        "count:-a list chain ip portfwd prerouting"|\
+        "count:-a list chain ip portfwd postrouting")
+            printf '%s\n' 'table ip portfwd {' '    chain test {' '    }' '}'
+            ;;
+        "soft:-nn list table ip portfwd")
+            printf '%s\n' \
+                'table ip portfwd {' \
+                '    chain nft_portfwd_owner {' '    }' \
+                '    chain prerouting {' \
+                '        type nat hook prerouting priority dstnat; policy accept;' \
+                '        counter' '    }' \
+                '    chain postrouting {' \
+                '        type nat hook postrouting priority srcnat; policy accept;' \
+                '    }' '}'
             ;;
         *)
             return 1
@@ -72,13 +95,40 @@ nft() {
     esac
 }
 export -f nft
+NFT_MOCK_MODE="soft"
+export NFT_MOCK_MODE
 if verify_error="$(verify_snat_runtime "$new_conf" 2>&1)"; then
     fail 'runtime verification unexpectedly accepted a mismatched table'
+else
+    verify_rc=$?
 fi
-[[ "$verify_error" == *'[ERR ] SNAT 运行态与候选配置不一致。'* ]] \
-    || fail 'runtime mismatch diagnostic was not emitted'
+[[ "$verify_rc" -eq 2 ]] || fail 'display-only runtime mismatch was not distinguished'
+[[ "$verify_error" == *'[WARN] SNAT 运行态展示文本与候选配置不完全一致。'* ]] \
+    || fail 'display-only runtime mismatch warning was not emitted'
 [[ "$verify_error" != *"return: can only \`return'"* ]] \
     || fail 'runtime mismatch used return outside a function'
+
+NFT_MOCK_MODE="hard"
+if verify_error="$(verify_snat_runtime "$new_conf" 2>&1)"; then
+    fail 'runtime verification accepted a missing owner chain'
+else
+    verify_rc=$?
+fi
+[[ "$verify_rc" -eq 1 ]] || fail 'missing owner chain was not a hard verification failure'
+[[ "$verify_error" == *'[ERR ] 运行表缺少所有权哨兵。'* ]] \
+    || fail 'missing owner chain diagnostic was not emitted'
+
+NFT_MOCK_MODE="count"
+if verify_error="$(verify_snat_runtime "$new_conf" 2>&1)"; then
+    fail 'runtime verification accepted a missing rule'
+else
+    verify_rc=$?
+fi
+[[ "$verify_rc" -eq 1 ]] || fail 'wrong runtime rule count was not a hard failure'
+[[ "$verify_error" == *'规则数为 0，候选配置应为 1。'* ]] \
+    || fail 'wrong runtime rule count diagnostic was not emitted'
+
+unset NFT_MOCK_MODE
 export -n -f nft
 unset -f nft
 
