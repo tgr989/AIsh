@@ -71,12 +71,12 @@ nft() {
             ;;
         "soft:-a list chain ip portfwd prerouting"|\
         "soft:-a list chain ip portfwd postrouting")
-            printf '%s\n' 'table ip portfwd {' '    chain test {' \
+            printf '%s\n' 'table ip portfwd {' '    chain test { # handle 10' \
                 '        counter # handle 1' '    }' '}'
             ;;
         "count:-a list chain ip portfwd prerouting"|\
         "count:-a list chain ip portfwd postrouting")
-            printf '%s\n' 'table ip portfwd {' '    chain test {' '    }' '}'
+            printf '%s\n' 'table ip portfwd {' '    chain test { # handle 10' '    }' '}'
             ;;
         "soft:-nn list table ip portfwd")
             printf '%s\n' \

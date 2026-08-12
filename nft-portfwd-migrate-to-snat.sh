@@ -229,7 +229,14 @@ for chain in "$CHAIN_PREROUTING" "$CHAIN_POSTROUTING"; do
         printf '%s\n' "[ERR ] 运行表缺少受管链：${chain}" >&2
         exit 1
     }
-    runtime_rule_count="$(grep -Ec '# handle [0-9]+([[:space:]]*)$' <<< "$chain_output" || true)"
+    runtime_rule_count=0
+    while IFS= read -r handle_line || [[ -n "$handle_line" ]]; do
+        [[ "$handle_line" =~ \#[[:space:]]handle[[:space:]][0-9]+[[:space:]]*$ ]] || continue
+        if [[ "$handle_line" =~ ^[[:space:]]*(table|chain)[[:space:]] ]]; then
+            continue
+        fi
+        (( ++runtime_rule_count ))
+    done <<< "$chain_output"
     if (( runtime_rule_count != expected_rule_count )); then
         printf '%s\n' \
             "[ERR ] 运行链 ${chain} 的规则数为 ${runtime_rule_count}，候选配置应为 ${expected_rule_count}。" >&2
