@@ -1379,6 +1379,9 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION} (static-snat)
 
 说明:
     - 默认进入交互菜单模式
+    - 模式固定为 DNAT + 静态 SNAT；LOCAL_IP 取默认路由实际选择的源 IPv4
+    - 配置使用 snat to \$LOCAL_IP；加载后的运行态会显示展开后的具体 IPv4
+    - --check 会检测配置 LOCAL_IP 与当前出口 IPv4 是否发生漂移
     - 菜单与两种 --check 需要 root 权限；--help/--version 不需要
     - 健康检查不修改系统配置
 

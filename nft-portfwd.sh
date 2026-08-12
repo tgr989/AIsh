@@ -1289,6 +1289,7 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION}
 
 说明:
     - 默认进入交互菜单模式
+    - 模式固定为 DNAT + MASQUERADE；静态 SNAT 请使用 nft-portfwd-snat.sh
     - 菜单与两种 --check 需要 root 权限；--help/--version 不需要
     - 健康检查不修改系统配置
 

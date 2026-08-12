@@ -44,10 +44,16 @@ print_help() {
 要求:
   ${SOURCE_SCRIPT}
   ${TARGET_SCRIPT}
-  必须与本迁移脚本位于同一目录。
+  必须与本迁移脚本来自同一版本，并位于同一目录。
+  ${CONF_FILE} 必须是原 MASQUERADE 版生成的 v2 托管配置。
 
 说明:
   --yes  跳过最终确认，适合无人值守执行。
+  迁移会先校验旧配置和 SNAT 候选配置，再使用 nft -f 原子加载候选规则。
+  table、所有权链、prerouting/postrouting 及规则数量属于硬校验，失败会恢复原运行态。
+  nft list 的等价展示格式可能因版本不同而产生警告，但不会单独导致回滚。
+  成功后原位更新 ${CONF_FILE}，并永久保留一份 MASQUERADE 配置备份。
+  确认 SNAT 正常后可删除：nft-portfwd-migrate-to-snat.sh nft-portfwd.sh
 EOF
 }
 
@@ -349,6 +355,8 @@ main() {
     info "迁移成功：${rule_count} 条规则已改为静态 SNAT。"
     info "旧配置备份：${BACKUP_FILE}"
     info "后续请使用：sudo ./nft-portfwd-snat.sh"
+    info "确认 SNAT 运行正常后，可删除迁移脚本与原 MASQUERADE 脚本："
+    printf '  rm nft-portfwd-migrate-to-snat.sh nft-portfwd.sh\n'
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

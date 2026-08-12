@@ -149,5 +149,8 @@ printf '%s|' "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_PREROUTING" "$CHAIN_POSTROUTI
 BASH
 )"
 [[ "$source_identity" == "$target_identity" ]] || fail 'main script identity constants differ'
+grep -Fq "printf '  rm nft-portfwd-migrate-to-snat.sh nft-portfwd.sh\\n'" \
+    "${SCRIPT_DIR}/nft-portfwd-migrate-to-snat.sh" \
+    || fail 'post-migration cleanup hint is missing'
 
 printf 'PASS: nft-portfwd MASQUERADE-to-SNAT migration tests\n'
