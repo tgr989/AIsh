@@ -5,6 +5,7 @@ Utility scripts for Linux server operations.
 ## Scripts
 
 - `nft-portfwd.sh`: nftables port-forward manager (DNAT + MASQUERADE).
+- `nft-neighbor-ban.sh`: nftables same-/24 neighbor ban (INPUT drop, keep self + gateway).
 - `ssh_port_fix.sh`: SSH port hardening and config helper.
 - `install_realm.sh`: realm proxy installer.
 
@@ -116,8 +117,35 @@ Validate configuration before applying manually:
 nft -c -f /etc/nftables.conf
 ```
 
+## nft-neighbor-ban Quick Start
+
+```bash
+chmod +x ./nft-neighbor-ban.sh
+sudo ./nft-neighbor-ban.sh              # menu
+sudo ./nft-neighbor-ban.sh enable -y    # one-shot ban same /24 neighbors
+sudo ./nft-neighbor-ban.sh status
+sudo ./nft-neighbor-ban.sh disable -y
+```
+
+Optional overrides:
+
+```bash
+sudo ./nft-neighbor-ban.sh enable --iface eth0 --ip 203.0.113.10 --gateway 203.0.113.1
+sudo ./nft-neighbor-ban.sh enable --allow 203.0.113.50 -y
+sudo ./nft-neighbor-ban.sh enable --dry-run
+```
+
+Notes:
+
+- Manages only `table inet neighbor_ban` (INPUT filter); does not touch `portfwd` NAT rules.
+- Always accepts self; accepts gateway only when it is inside the target /24; then drops the rest of that NIC's /24.
+- Warns if the current SSH client sits in the target /24 without `--allow`; with `-y` this is refused until `--allow` is set.
+- Persisted conf uses `destroy table` (or `add`+`delete` on older nft) so reloads replace the table instead of appending rules.
+- Persists to `/etc/nftables.d/neighbor-ban.conf`; reboot persistence still needs `/etc/nftables.conf` include + `nftables.service`.
+
 Run the offline unit checks with:
 
 ```bash
 bash ./nft-portfwd.test.sh
+bash ./nft-neighbor-ban.test.sh
 ```
