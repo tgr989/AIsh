@@ -19,7 +19,7 @@ TABLE_NAME="portfwd"
 CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/portfwd.conf"
@@ -198,7 +198,7 @@ prompt_proto_choice() {
 }
 
 validate_ipv4_basic() {
-    local ip="${1:-}"
+    local ip="${1:-}" o1 o2 o3 o4 o
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
     [[ ! "$ip" =~ (^|[.])0[0-9] ]] || return 1
 
@@ -261,6 +261,106 @@ address_family() {
     fi
 }
 
+format_ipv6_address() {
+    local -n groups="$1"
+    local prefix="$2" i zero_count=0 best_count=1 best_start=-1
+    local formatted="" separator="" hex ipv4_prefix="::"
+
+    # 连续零组的长度相同，优先压缩左侧。
+    for (( i=0; i<8; i++ )); do
+        if (( groups[i] == 0 )); then
+            (( ++zero_count ))
+            if (( zero_count > best_count )); then
+                best_count="$zero_count"
+                best_start=$((i - zero_count + 1))
+            fi
+        else
+            zero_count=0
+        fi
+    done
+
+    # 保留旧版及 Linux nft 对 IPv4 兼容/映射地址的点分形式。
+    if (( best_start == 0 && (best_count == 6 || (best_count == 5 && groups[5] == 0xffff)) )); then
+        if (( best_count == 5 )); then
+            ipv4_prefix+="ffff:"
+        fi
+        printf '%s%d.%d.%d.%d%s\n' "$ipv4_prefix" \
+            "$((groups[6] >> 8))" "$((groups[6] & 255))" \
+            "$((groups[7] >> 8))" "$((groups[7] & 255))" "${prefix:+/$prefix}"
+        return
+    fi
+
+    for (( i=0; i<8; i++ )); do
+        if (( i == best_start )); then
+            formatted+="::"
+            separator=""
+            (( i += best_count - 1 ))
+        else
+            printf -v hex '%x' "${groups[i]}"
+            formatted+="$separator$hex"
+            separator=":"
+        fi
+    done
+    printf '%s%s\n' "$formatted" "${prefix:+/$prefix}"
+}
+
+normalize_ipv6() {
+    local LC_ALL=C
+    local address="$1" kind="$2" prefix="" dotted i host_mask
+    local hex_group='[[:xdigit:]]{1,4}' group_list
+    local -a words=() tail=()
+
+    if [[ "$kind" == cidr ]]; then
+        [[ "$address" == */* ]] || return 1
+        prefix="${address##*/}"
+        address="${address%/*}"
+        [[ "$prefix" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( prefix <= 128 )) || return 1
+    fi
+
+    if [[ "$address" == *.* ]]; then
+        [[ "$address" == *:* ]] || return 1
+        dotted="${address##*:}"
+        validate_ipv4_basic "$dotted" || return 1
+        local o1 o2 o3 o4
+        IFS='.' read -r o1 o2 o3 o4 <<< "$dotted"
+        printf -v address '%s:%x:%x' "${address%:*}" "$((o1 << 8 | o2))" "$((o3 << 8 | o4))"
+    fi
+
+    if [[ "$address" == *::* ]]; then
+        group_list="$hex_group(:$hex_group)*"
+        [[ "$address" =~ ^($group_list)?::($group_list)?$ ]] || return 1
+        IFS=':' read -ra words <<< "${address%%::*}"
+        IFS=':' read -ra tail <<< "${address#*::}"
+        (( ${#words[@]} + ${#tail[@]} < 8 )) || return 1
+        while (( ${#words[@]} + ${#tail[@]} < 8 )); do
+            words+=(0)
+        done
+        words+=("${tail[@]}")
+    else
+        [[ "$address" =~ ^($hex_group:){7}$hex_group$ ]] || return 1
+        IFS=':' read -ra words <<< "$address"
+    fi
+
+    for i in "${!words[@]}"; do
+        words[i]=$((16#${words[i]}))
+    done
+
+    if [[ "$kind" == cidr ]]; then
+        host_mask=$((0xffff >> (prefix % 16)))
+        for (( i=prefix / 16; i<8; i++ )); do
+            (( (words[i] & host_mask) == 0 )) || return 1
+            host_mask=0xffff
+        done
+    else
+        # 监听和目标排除特殊地址，来源前缀仍可匹配这些地址。
+        (( (words[0] & 0xffc0) != 0xfe80 && (words[0] & 0xff00) != 0xff00 )) || return 1
+        if (( (words[0] | words[1] | words[2] | words[3] | words[4]) == 0 )); then
+            (( words[5] != 0xffff && (words[5] != 0 || words[6] != 0 || words[7] > 1) )) || return 1
+        fi
+    fi
+    format_ipv6_address words "$prefix"
+}
+
 # 地址在进入 RULES 前统一规范化，确保不同 IPv6 写法使用同一个监听键。
 normalize_ip() {
     local family="$1" value="$2" kind="${3:-address}"
@@ -273,32 +373,7 @@ normalize_ip() {
         printf '%s\n' "$value"
         return 0
     fi
-    command -v python3 >/dev/null || { err "IPv6 地址校验需要 Python 3（标准库 ipaddress）。"; return 1; }
-    python3 -I - "$kind" "$value" <<'PY'
-import ipaddress
-import socket
-import sys
-
-kind, value = sys.argv[1:]
-try:
-    if "%" in value:
-        raise ValueError
-    if kind == "cidr":
-        network = ipaddress.IPv6Network(value, strict=True)
-        if value.rpartition("/")[2] != str(network.prefixlen):
-            raise ValueError
-        print("{}/{}".format(socket.inet_ntop(socket.AF_INET6, network.network_address.packed),
-                             network.prefixlen))
-    else:
-        addr = ipaddress.IPv6Address(value)
-        if (addr.is_unspecified or addr.is_loopback or addr.is_link_local
-                or addr.is_multicast or addr.ipv4_mapped is not None):
-            raise ValueError
-        # Match the address spelling used by Linux ip and nft, including embedded IPv4.
-        print(socket.inet_ntop(socket.AF_INET6, addr.packed))
-except ValueError:
-    sys.exit(1)
-PY
+    normalize_ipv6 "$value" "$kind"
 }
 
 format_endpoint() {
@@ -1373,7 +1448,7 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION}
     --check-strict   严格检查；持久化问题也返回失败
 
 说明:
-    - 目标支持 IPv4:端口 或 [IPv6]:端口，例如 [2001:db8::2]:443；IPv6 地址校验需要 python3
+    - 目标支持 IPv4:端口 或 [IPv6]:端口，例如 [2001:db8::2]:443
     - 默认进入交互菜单模式
     - 模式固定为 DNAT + MASQUERADE；静态 SNAT 请使用 nft-portfwd-snat.sh
     - 菜单与两种 --check 需要 root 权限；--help/--version 不需要

@@ -16,17 +16,31 @@ named_v6="$v6|$rule_name"
 
 for script in nft-portfwd.sh nft-portfwd-snat.sh; do (
     source "$script_dir/$script"
-    parse_target '[2001:0DB8:0:0::ABCD]:65535' dip dport
-    [[ "$dip" == 2001:db8::abcd && "$dport" == 65535 ]] || fail 'IPv6 endpoint normalization'
-    for target in '2001:db8::a:443' '[192.0.2.1]:443' '[::1]:443' '[::]:443' '[fe80::1%eth0]:443' \
-                  '[ff02::1]:80' '[::ffff:192.0.2.1]:80' '[2001:db8::1]:65536' '[1::2::3]:80'; do
-        expect_fail parse_target "$target" dip dport
-    done
-    [[ "$(normalize_ip ip6 '2001:0DB8::/64' cidr)" == '2001:db8::/64' ]] || fail 'IPv6 prefix'
-    [[ "$(normalize_ip ip6 'fd00::a/128' cidr)" == 'fd00::a/128' ]] || fail 'host prefix'
-    for cidr in '2001:db8::a/64' 'fd00::/129' 'fd00::' '0.0.0.0/0' 'fe80::%eth0/64'; do
-        expect_fail normalize_ip ip6 "$cidr" cidr
-    done
+    (
+        # 地址和前缀解析在找不到外部程序时也应工作。
+        PATH=/dev/null
+        parse_target '[2001:0DB8:0:0::ABCD]:65535' dip dport
+        [[ "$dip" == 2001:db8::abcd && "$dport" == 65535 ]] || fail 'IPv6 endpoint normalization'
+        [[ "$(normalize_ip ip6 '2001:0:0:1:0:0:2:3')" == 2001::1:0:0:2:3 ]] || fail 'equal zero runs'
+        [[ "$(normalize_ip ip6 '2001:db8::1:2:3:4:5')" == 2001:db8:0:1:2:3:4:5 ]] || fail 'single zero group'
+        [[ "$(normalize_ip ip6 '64:ff9b::192.0.2.1')" == 64:ff9b::c000:201 ]] || fail 'dotted IPv4 tail'
+        [[ "$(normalize_ip ip6 '::c000:0201')" == ::192.0.2.1 ]] || fail 'legacy IPv4-compatible spelling'
+        for target in '2001:db8::a:443' '[192.0.2.1]:443' '[::1]:443' '[::]:443' '[fe80::1%eth0]:443' \
+                      '[febf::1]:443' '[ff02::1]:80' '[::ffff:192.0.2.1]:80' '[2001:db8::1]:65536' \
+                      '[1::2::3]:80' '[1:::2]:80' '[1:2:3:4:5:6:7::8]:80' '[64:ff9b::192.0.02.1]:80'; do
+            expect_fail parse_target "$target" dip dport
+        done
+        [[ "$(normalize_ip ip6 '0:0:0:0:0:0:0:0/0' cidr)" == '::/0' ]] || fail 'default IPv6 prefix'
+        [[ "$(normalize_ip ip6 '2001:0DB8::/64' cidr)" == '2001:db8::/64' ]] || fail 'IPv6 prefix'
+        [[ "$(normalize_ip ip6 '2001:db8:0:0:8000::/65' cidr)" == '2001:db8:0:0:8000::/65' ]] || fail 'partial group prefix'
+        [[ "$(normalize_ip ip6 'fd00::a/128' cidr)" == 'fd00::a/128' ]] || fail 'host prefix'
+        [[ "$(normalize_ip ip6 '::ffff:c000:0201/128' cidr)" == '::ffff:192.0.2.1/128' ]] \
+            || fail 'legacy mapped prefix spelling'
+        for cidr in '2001:db8::a/64' '2001:db8:0:0:8001::/65' '2001:db8::/064' \
+                    'fd00::/129' 'fd00::' '0.0.0.0/0' 'fe80::%eth0/64'; do
+            expect_fail normalize_ip ip6 "$cidr" cidr
+        done
+    )
 
     RULES=("$v4" "$named_v6" "$udp6")
     SNAT_IP=192.0.2.10 SNAT_IP6=2001:db8::10

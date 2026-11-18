@@ -209,7 +209,7 @@ expect_ok finish_health_check 0 0 strict >/dev/null 2>&1
 CLI_MODE="menu"
 expect_ok handle_cli_args --check-strict
 [[ "$CLI_MODE" == "check-strict" ]] || fail '--check-strict did not select strict mode'
-[[ "$SCRIPT_VERSION" == "2.3.0" ]] || fail 'unexpected script version'
+[[ "$SCRIPT_VERSION" == "2.3.1" ]] || fail 'unexpected script version'
 help_out="$(print_help)"
 grep -Fq "$CONF_FILE" <<< "$help_out" || fail 'help omitted managed conf path'
 grep -Fq "$SYSCTL_FILE" <<< "$help_out" || fail 'help omitted sysctl path'

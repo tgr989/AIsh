@@ -43,7 +43,6 @@ Both variants match the listen address, port, protocol, optional ingress interfa
 ## Requirements
 
 - Linux with Bash 4.4+
-- Python 3 with the standard `ipaddress` module for IPv6 address and prefix validation. IPv4-only configurations retain their existing dependencies.
 - Root privileges for menu, health-check and migration operations
 - `nftables`, `iproute2`, `procps` (`sysctl`) and `util-linux` (`flock`)
 - Standard GNU/Linux tools used by the scripts (`grep`, `stat`, `install`, `mktemp`, `cmp`, and related core utilities)
