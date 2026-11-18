@@ -1,13 +1,13 @@
 # aish
 
-Operational shell scripts for Linux servers. The nftables tools are deliberately scoped: each manager owns one named table and avoids taking over unrelated firewall state.
+Operational shell scripts for Linux servers. The nftables tools are deliberately scoped: each manager owns named tables and avoids taking over unrelated firewall state.
 
 ## Script inventory
 
 | Script | Purpose |
 | --- | --- |
-| `nft-portfwd.sh` | IPv4 port-forward manager using DNAT + MASQUERADE. |
-| `nft-portfwd-snat.sh` | IPv4 port-forward manager using DNAT + static SNAT. |
+| `nft-portfwd.sh` | IPv4/IPv6 port-forward manager using DNAT + MASQUERADE. |
+| `nft-portfwd-snat.sh` | IPv4/IPv6 port-forward manager using DNAT + static SNAT. |
 | `nft-portfwd-migrate-to-snat.sh` | In-place migration from the managed MASQUERADE configuration to static SNAT. |
 | `nft-neighbor-ban.sh` | Block same-/24 neighbors from reaching the host while keeping self and gateway access. |
 | `ssh_port_fix.sh` | Validate and update the OpenSSH listening port. |
@@ -21,7 +21,8 @@ The `*.test.sh` files are offline regression tests for the corresponding nftable
 Both port-forward managers share the same managed identity:
 
 ```text
-table ip portfwd
+table ip portfwd     (IPv4)
+table ip6 portfwd    (IPv6)
 /etc/nftables.d/portfwd.conf
 /run/nft-portfwd/lock
 # MANAGED-BY: nft-portfwd v2
@@ -31,17 +32,18 @@ Choose one active manager for a host. Do not alternate between the MASQUERADE an
 
 | Behavior | `nft-portfwd.sh` | `nft-portfwd-snat.sh` |
 | --- | --- | --- |
-| Source NAT action | `masquerade` | `snat to $LOCAL_IP` |
+| Source NAT action | `masquerade` | `snat to $LOCAL_IP` (IPv4) or `snat to $LOCAL_IP6` (IPv6) |
 | Address selection | Dynamic, based on the actual egress interface | Static, detected from the default route and stored in the config |
 | Address changes | Followed automatically by MASQUERADE | Detected by health check; menu `4` can resubmit the existing rules |
 | Typical fit | Dynamic addresses or multiple egress paths | Stable, single-egress VPS routing |
 | Backend sees real client IP | No | No |
 
-The DNAT match is otherwise the same: listen IPv4, listen port, protocol, optional ingress interface, optional source CIDR, and destination `IPv4:port`.
+Both variants match the listen address, port, protocol, optional ingress interface and optional source prefix. Select a backend using `IPv4:port` or `[IPv6]:port`. Each rule forwards within one address family (IPv4 NAT or NAT66). Both families can use the same port in the same configuration.
 
 ## Requirements
 
 - Linux with Bash 4.4+
+- Python 3 with the standard `ipaddress` module for IPv6 address and prefix validation. IPv4-only configurations retain their existing dependencies.
 - Root privileges for menu, health-check and migration operations
 - `nftables`, `iproute2`, `procps` (`sysctl`) and `util-linux` (`flock`)
 - Standard GNU/Linux tools used by the scripts (`grep`, `stat`, `install`, `mktemp`, `cmp`, and related core utilities)
@@ -87,53 +89,52 @@ sudo ./nft-portfwd-snat.sh --check-strict
 
 ## Rule model
 
-Managed rule metadata uses seven fields:
+Managed rule metadata has seven required fields and an optional final name.
 
 ```text
-listen_ip|listen_port|protocol|destination_ip|destination_port|ingress_interface|source_cidr
+listen_ip|listen_port|protocol|destination_ip|destination_port|ingress_interface|source_cidr[|name]
 ```
 
 Example using documentation-only addresses:
 
 ```text
 192.0.2.10|8443|tcp|10.0.0.8|443|eth0|203.0.113.0/24
+2001:db8:1::10|8443|tcp|fd00:2::8|443|eth0|2001:db8:3::/64|Home NAS
 ```
 
 This produces a DNAT rule scoped to the original listen address and an associated source-NAT rule scoped to the same original connection tuple. TCP and UDP are stored as separate rules; selecting `both` creates one rule for each protocol.
 
-Rules with the same listen IPv4, port and protocol cannot have overlapping ingress-interface scope, even if their source CIDRs differ. Source-based dispatch to different backends is intentionally unsupported.
+Names can contain spaces and Unicode. Use a single line and omit `|` and control characters. Existing seven-field rules appear as unnamed. When you add TCP and UDP together, both rules receive the name you enter.
 
-Source CIDRs must be canonical network addresses. `203.0.113.0/24` and `203.0.113.7/32` are valid; `203.0.113.7/24` is rejected.
+Rules with the same listen address, port and protocol cannot have overlapping ingress-interface scope, even if their source CIDRs differ. Source-based dispatch to different backends is intentionally unsupported.
 
-## Listen IPv4 and cloud NAT
+Source CIDRs must be canonical network addresses. `203.0.113.0/24` and `203.0.113.7/32` are valid; `203.0.113.7/24` is rejected. IPv6 accepts network prefixes such as `2001:db8:3::/64` and individual sources such as `2001:db8::7/128`. The unrestricted defaults are `0.0.0.0/0` and `::/0`. IPv6 input is stored in compressed lowercase form.
 
-The listen IPv4 is the destination address observed after the packet reaches the VPS (`ip daddr`). It is not necessarily the public address entered by the client.
+## Listen addresses and cloud NAT
 
-Many cloud providers implement public 1:1 NAT outside the guest. If the public address does not appear in `ip -4 addr`, select the private address that actually exists on the VPS. The add-rule prompt lists local global IPv4 addresses and accepts a typed address after confirmation.
+Use the destination address as it appears on the VPS ingress interface (`ip daddr` or `ip6 daddr`).
 
-## Static SNAT and `LOCAL_IP`
+Many cloud providers implement public 1:1 NAT outside the guest. If the public address does not appear in `ip -4 addr`, select the private address that actually exists on the VPS. The add-rule prompt lists local addresses of the backend’s family with global scope and accepts a typed address after confirmation.
 
-The SNAT configuration contains one nftables variable:
+## Static SNAT addresses
+
+A dual-stack configuration defines two nftables variables. Each active family needs its own egress address.
 
 ```nft
 define LOCAL_IP = 192.0.2.10
+define LOCAL_IP6 = 2001:db8:1::10
 ```
 
-Each managed postrouting rule uses:
+Postrouting rules use `snat to $LOCAL_IP` for IPv4 and `snat to $LOCAL_IP6` for IPv6. nftables expands each variable when it loads the file. The kernel listing shows the concrete address.
 
-```nft
-snat to $LOCAL_IP
-```
-
-`$LOCAL_IP` is an nftables configuration variable, not a shell environment variable. `nft -f` expands it while loading the file, so the kernel runtime listing normally shows the concrete IPv4 instead of `$LOCAL_IP`. There is no per-packet variable lookup and no performance difference from writing the address directly in every rule.
-
-The script obtains `LOCAL_IP` from the source address selected by:
+The script looks up the route-selected source for each address family in use.
 
 ```bash
 ip -4 route get 1.1.1.1
+ip -6 route get 2606:4700:4700::1111
 ```
 
-If no such route can be resolved, it falls back to the first non-loopback global IPv4. A private RFC1918 address is valid when that is the guest's real egress address behind provider NAT.
+If route lookup yields no usable source, the script selects a usable global-scope address on a non-loopback interface of the same family. IPv6-only rules require only an IPv6 egress address.
 
 Static means the stored value does not update by itself. If the address changes, `--check` reports the mismatch. Menu `4` can confirm and atomically resubmit the existing rules with the current address.
 
@@ -141,24 +142,13 @@ Static means the stored value does not update by itself. If the address changes,
 
 Migration is for an existing v2 configuration created by `nft-portfwd.sh`. It preserves:
 
-- `table ip portfwd`
+- the managed `ip portfwd` and/or `ip6 portfwd` tables
 - `/etc/nftables.d/portfwd.conf`
 - the lock and transaction paths
-- all seven-field `# RULE:` metadata
+- all `# RULE:` metadata, including optional names
 - listen/destination addresses, ports, protocols, interfaces and source CIDRs
 
-It changes the postrouting action from:
-
-```nft
-masquerade
-```
-
-to:
-
-```nft
-define LOCAL_IP = 192.0.2.10
-snat to $LOCAL_IP
-```
+Migration replaces each `masquerade` action with `snat to $LOCAL_IP` or `snat to $LOCAL_IP6` according to the rule’s address family.
 
 ### Download a consistent tool set
 
@@ -205,7 +195,7 @@ The migration tool:
 
 1. Acquires the same exclusive lock as both managers.
 2. Validates the current file with the MASQUERADE script and refuses drifted or unsafe input.
-3. Detects `LOCAL_IP`, renders a SNAT candidate and validates it with the SNAT script and `nft -c -f`.
+3. Detects the egress address for each family in use, renders a SNAT candidate and validates it with the SNAT script and `nft -c -f`.
 4. Creates a rollback ruleset and a permanent copy of the old MASQUERADE configuration.
 5. Loads the candidate with `nft -f`, which applies the file as an atomic nftables transaction.
 6. Verifies the managed table, ownership sentinel, prerouting/postrouting chains, and rule counts. Table/chain handles are not counted as rules.
@@ -230,13 +220,14 @@ Verify the stored and runtime rules:
 
 ```bash
 grep -E 'define LOCAL_IP|RULE:|RULE-SNAT:|snat to' /etc/nftables.d/portfwd.conf
-nft -nn list table ip portfwd
+nft -nn list table ip portfwd    # IPv4
+nft -nn list table ip6 portfwd   # IPv6
 sudo ./nft-portfwd-snat.sh --check
 ```
 
-The config should contain `$LOCAL_IP`; the runtime listing normally contains the expanded IPv4. New connections use static SNAT immediately. Connections that already existed may retain their previous conntrack NAT mapping until they close or expire.
+The runtime listing shows the address stored in the corresponding `LOCAL_IP` or `LOCAL_IP6` definition. New connections use static SNAT immediately. Connections that already existed may retain their previous conntrack NAT mapping until they close or expire.
 
-If the ordinary SNAT health check reports an expression mismatch, preserve the full `nft -nn list table ip portfwd` output for review instead of editing the managed file or transaction artifacts by hand.
+If the ordinary SNAT health check reports an expression mismatch, preserve the full `nft -nn list table` output for the affected family for review instead of editing the managed file or transaction artifacts by hand.
 
 After confirming forwarding works, stop using the MASQUERADE manager. The migration tool prints this optional cleanup command but never runs it automatically:
 
@@ -248,16 +239,17 @@ Keep `nft-portfwd-snat.sh`. The permanent pre-migration backup is reported in th
 
 ## Interactive workflow
 
-1. Menu `1`: add a forward. Choose the listen IPv4, destination, protocol, optional source CIDR and optional ingress interface.
-2. Menu `2`: list managed rules and optionally display the raw nftables table.
-3. Menu `3`: delete by list number. Space/comma multi-selection and `n+`/`n-` are supported; enter `all` to clear all rules.
-4. Menu `4`: inspect and optionally repair the include and IPv4-forwarding setup. The SNAT version also offers to refresh a drifted `LOCAL_IP`.
+1. Menu `1` adds a forward with an optional name. Enter the backend, such as `[2001:db8::8]:443`, and select a listen address of the same family, the protocol, and any source or ingress restrictions.
+2. Menu `2` lists managed rules and their names. It can also display the raw nftables table.
+3. Menu `3` deletes rules by list number and shows their names before confirmation. You can select multiple rules with spaces, commas, or `n+`/`n-`. Enter `all` to clear all rules.
+4. Menu `4` checks IP forwarding and offers to restore missing or drifted managed tables from the saved configuration. It can also configure boot loading with confirmation and then runs the strict health check. The SNAT version offers to refresh changed egress addresses.
+5. Menu `5` edits a rule's saved name by list number. Submit a blank name to clear it. This saves the configuration metadata without reloading nftables.
 
 An invalid managed configuration places startup in read-only diagnostic mode. Mutation actions remain unavailable until a trusted configuration is restored or the deployment is manually reinitialized.
 
 ## Safety boundaries
 
-- Only `table ip portfwd` is managed.
+- IPv4 uses `table ip portfwd` and IPv6 uses `table ip6 portfwd`. Both share one file, lock and transaction. Once a table has been managed, deleting its last rule rebuilds the table with empty NAT chains. Existing IPv4 v2 files load without conversion.
 - An ownership sentinel prevents taking over an unrelated table with the same name.
 - Configuration, lock and transaction files are checked for safe owner/mode and symbolic-link misuse.
 - `flock` serializes managers and migration operations.
@@ -265,8 +257,9 @@ An invalid managed configuration places startup in read-only diagnostic mode. Mu
 - Runtime and disk commits use a marker plus a pre-generated rollback file for crash recovery.
 - Existing firewalld, UFW, iptables, BBR settings and unrelated nftables tables are not modified.
 - The scripts manage NAT, not filter/FORWARD policy. Host firewalls, cloud security groups and upstream ACLs can still block traffic.
-- Clearing all rules does not automatically disable the host-wide `net.ipv4.ip_forward` setting.
-- Enabling `nftables.service` is optional and defaults to no; verify that nftables is the intended firewall owner first.
+- Adding a rule offers to enable the corresponding forwarding switch. Clearing rules preserves the operating system’s forwarding settings. IPv4 and IPv6 use separate sysctl drop-ins.
+- If the IPv6 default route comes from router advertisements, configure `accept_ra=2` on the uplink to keep learning the route with forwarding enabled. The manager leaves RA settings to the operator. [Linux IP sysctl documentation](https://docs.kernel.org/networking/ip-sysctl.html)
+- Boot enablement for `nftables.service` requires confirmation and defaults to no. The manager enables the unit for boot after verifying its configuration path and include.
 
 Boot persistence requires `/etc/nftables.conf` to contain:
 
@@ -299,22 +292,25 @@ sudo ./nft-portfwd-snat.sh --check-strict
 
 # managed config and runtime
 nft -nn list table ip portfwd
+nft -nn list table ip6 portfwd
 grep -E 'RULE:|RULE-MASQ:|RULE-SNAT:' /etc/nftables.d/portfwd.conf
 nft -c -f /etc/nftables.d/portfwd.conf
 
 # forwarding and persistence
-sysctl net.ipv4.ip_forward
+sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
 cat /etc/sysctl.d/99-portfwd-ip-forward.conf
+cat /etc/sysctl.d/99-portfwd-ipv6-forward.conf
 grep -nE 'include.*/etc/nftables\.d' /etc/nftables.conf
 
 # enable boot loading only after confirming firewall ownership
-systemctl enable --now nftables
+systemctl enable nftables
 systemctl status nftables
 nft list ruleset
 
 # troubleshooting
 ip -4 route get 1.1.1.1
 ip -4 addr show scope global
+ip -6 addr show scope global
 ss -lntup
 systemctl is-active firewalld 2>/dev/null
 ufw status 2>/dev/null
@@ -412,6 +408,7 @@ The tests do not modify the host firewall:
 ```bash
 bash ./nft-portfwd.test.sh
 bash ./nft-portfwd-snat.test.sh
+bash ./nft-portfwd-ipv6.test.sh
 bash ./nft-portfwd-migrate-to-snat.test.sh
 bash ./nft-neighbor-ban.test.sh
 ```

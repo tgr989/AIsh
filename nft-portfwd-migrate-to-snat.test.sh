@@ -128,6 +128,38 @@ fi
 [[ "$verify_error" == *'规则数为 0，候选配置应为 1。'* ]] \
     || fail 'wrong runtime rule count diagnostic was not emitted'
 
+# A display difference in IPv4 must never hide a missing IPv6 ownership chain.
+(
+    source "${SCRIPT_DIR}/nft-portfwd.sh"
+    RULES=('192.0.2.10|8443|tcp|10.0.0.2|443|eth0|203.0.113.0/24'
+           '2001:db8::10|8443|tcp|fd00::2|443|eth0|2001:db8:1::/64|相册 NAS')
+    render_conf_file "$old_conf"
+)
+expect_ok render_snat_candidate "$old_conf" "$new_conf" '198.51.100.10' '2001:db8::9'
+expect_ok validate_config_with "$TARGET_SCRIPT" "$new_conf"
+grep -Fqx 'define LOCAL_IP6 = 2001:db8::9' "$new_conf" || fail 'IPv6 migration lost egress'
+grep -Fq 'dnat to [fd00::2]:443' "$new_conf" || fail 'IPv6 migration lost backend'
+grep -Fq 'snat to $LOCAL_IP6' "$new_conf" || fail 'IPv6 migration lost source NAT'
+grep -Fqx '        # RULE: 2001:db8::10|8443|tcp|fd00::2|443|eth0|2001:db8:1::/64|相册 NAS' "$new_conf" \
+    || fail 'IPv6 migration lost the rule name'
+NFT_MOCK_MODE=soft
+if verify_error="$(verify_snat_runtime "$new_conf" 2>&1)"; then
+    fail 'migration accepted a missing IPv6 table'
+else
+    verify_rc=$?
+fi
+[[ "$verify_rc" == 1 && "$verify_error" == *'ip6 portfwd'* ]] || fail 'IPv6 hard failure masked by IPv4 display warning'
+
+(
+    source "${SCRIPT_DIR}/nft-portfwd.sh"
+    RULES=('2001:db8::10|8443|udp|fd00::2|443|*|::/0')
+    render_conf_file "$old_conf"
+)
+expect_ok render_snat_candidate "$old_conf" "$new_conf" '' 'fd00::9'
+expect_ok validate_config_with "$TARGET_SCRIPT" "$new_conf"
+expect_fail grep -Fq 'define LOCAL_IP =' "$new_conf"
+expect_fail grep -Fq 'table ip portfwd' "$new_conf"
+
 unset NFT_MOCK_MODE
 export -n -f nft
 unset -f nft

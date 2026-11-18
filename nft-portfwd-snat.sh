@@ -8,8 +8,8 @@ umask 027
 #
 # nftables 端口转发管理脚本（nft-portfwd-snat）
 #
-# - 管理独立表 table ip portfwd
-# - DNAT + 静态 SNAT（SNAT 地址为本机默认路由出口 IPv4）
+# - 按地址族管理 table ip portfwd / table ip6 portfwd
+# - DNAT + 静态 SNAT（各地址族使用本机相应的出口地址）
 # - 协议 tcp/udp（可同时添加，默认 both）
 # - 检查/持久化 ip_forward 与 nftables include
 #
@@ -19,7 +19,7 @@ TABLE_NAME="portfwd"
 CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
-SCRIPT_VERSION="2.2.4"
+SCRIPT_VERSION="2.3.0"
 SCRIPT_BASENAME="${BASH_SOURCE[0]##*/}"
 
 CONF_DIR="/etc/nftables.d"
@@ -36,7 +36,7 @@ CONF_MAGIC="# MANAGED-BY: nft-portfwd v2"
 
 INCLUDE_GLOB="/etc/nftables.d/*.conf"
 INCLUDE_LINE="include \"${INCLUDE_GLOB}\""
-INCLUDE_CHECK_REGEX="^[[:space:]]*include[[:space:]]+[\"']?/etc/nftables\\.d/\\*\\.conf[\"']?([[:space:]]*;)?[[:space:]]*$"
+INCLUDE_CHECK_REGEX="^[[:space:]]*include[[:space:]]+[\"']?/etc/nftables\\.d/(\\*|portfwd)\\.conf[\"']?[[:space:]]*;?[[:space:]]*(#.*)?$"
 
 readonly TABLE_FAMILY TABLE_NAME CHAIN_PREROUTING CHAIN_POSTROUTING SCRIPT_DISPLAY_NAME SCRIPT_VERSION
 readonly SCRIPT_BASENAME
@@ -47,12 +47,17 @@ readonly CONF_MAGIC
 readonly INCLUDE_GLOB INCLUDE_LINE INCLUDE_CHECK_REGEX
 
 # 规则存储格式:
-# listen_ip|lport|proto|dest_ip|dest_port|iif|source_cidr
+# listen_ip|lport|proto|dest_ip|dest_port|iif|source_cidr[|rule_name]
 # proto 仅存 tcp / udp；如果用户选 both，会展开成两条
 # iif 为入口网卡名（如 eth0）或 *（不限制）
-# source_cidr 默认为 0.0.0.0/0
+# source_cidr 默认为 IPv4 的 0.0.0.0/0 或 IPv6 的 ::/0
 declare -a RULES=()
+# 清空最后一条规则时仍重建已托管的表，避免旧 NAT 规则残留。
+declare -A CONFIG_TABLES=()
+declare -Ar FORWARD_KEYS=([ip]=net.ipv4.ip_forward [ip6]=net.ipv6.conf.all.forwarding)
+declare -Ar FORWARD_FILES=([ip]="$SYSCTL_FILE" [ip6]=/etc/sysctl.d/99-portfwd-ipv6-forward.conf)
 SNAT_IP=""
+SNAT_IP6=""
 LOCK_FD=""
 CONFIG_LOAD_ERRORS=0
 CLI_MODE="menu"
@@ -93,16 +98,23 @@ answer_yes_default_no() {
 }
 
 main_conf_has_include() {
-    [[ -f "$MAIN_CONF" ]] || return 1
-    grep -Eiq "$INCLUDE_CHECK_REGEX" "$MAIN_CONF" 2>/dev/null
+    local conf_path="${1:-$MAIN_CONF}"
+    [[ -f "$conf_path" ]] || return 1
+    grep -Eq "$INCLUDE_CHECK_REGEX" "$conf_path" 2>/dev/null
 }
 
 nftables_service_uses_main_conf() {
-    local exec_start
+    local exec_start file_arg
     command -v systemctl >/dev/null 2>&1 || return 1
     exec_start="$(systemctl show nftables --property=ExecStart --value 2>/dev/null)" || return 1
-    [[ -n "$exec_start" ]] || return 1
-    grep -Fq -- "-f ${MAIN_CONF}" <<< "$exec_start"
+    file_arg="[[:space:]](-f[[:space:]]+|--file([[:space:]]+|=))${MAIN_CONF//./[.]}([[:space:];]|$)"
+    [[ "$exec_start" =~ $file_arg ]]
+}
+
+nftables_is_enabled_at_boot() {
+    local state
+    state="$(systemctl is-enabled nftables 2>/dev/null)" || return 1
+    [[ "$state" == enabled ]]
 }
 
 show_persistence_hint() {
@@ -111,8 +123,10 @@ show_persistence_hint() {
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
-        if ! systemctl is-enabled --quiet nftables 2>/dev/null; then
+        if ! nftables_is_enabled_at_boot; then
             warn_nftables_service_not_enabled "持久化未就绪："
+        elif ! nftables_service_uses_main_conf; then
+            warn "持久化未就绪：nftables.service 的启动命令未确认使用 ${MAIN_CONF}。"
         fi
     else
         warn "无法验证 nftables 开机加载：未发现 systemctl"
@@ -122,10 +136,7 @@ show_persistence_hint() {
 # 提示如何启用 nftables 开机加载；prefix 用于区分调用场景文案。
 warn_nftables_service_not_enabled() {
     local prefix="${1:-}"
-    warn "${prefix}nftables.service 未开机自启；添加规则时可选择启用（默认否）。"
-    warn "请先确认本机以 nftables 为唯一防火墙（勿与 firewalld/ufw/iptables 抢接管），再执行："
-    warn "  systemctl enable --now nftables"
-    warn "可选检查：systemctl status nftables && nft list ruleset"
+    warn "${prefix}nftables.service 未永久启用；可用菜单 4 检查并配置开机加载。"
 }
 
 check_root() {
@@ -151,6 +162,10 @@ validate_port() {
     local port="${1:-}"
     [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
     (( port >= 1 && port <= 65535 ))
+}
+
+validate_rule_name() {
+    [[ "$1" != *'|'* && "$1" != *[[:cntrl:]]* ]]
 }
 
 # 交互选择协议；通过 nameref 写回协议数组（tcp / udp / tcp+udp）。
@@ -242,6 +257,115 @@ ipv4_cidr_network() {
         "$(( (network >> 8) & 255 ))" "$(( network & 255 ))" "$prefix"
 }
 
+address_family() {
+    if [[ "$1" == *:* ]]; then
+        printf 'ip6\n'
+    else
+        printf 'ip\n'
+    fi
+}
+
+# 地址在进入 RULES 前统一规范化，确保不同 IPv6 写法使用同一个监听键。
+normalize_ip() {
+    local family="$1" value="$2" kind="${3:-address}"
+    if [[ "$family" == ip ]]; then
+        if [[ "$kind" == cidr ]]; then
+            validate_ipv4_cidr "$value" || return 1
+        else
+            validate_ipv4 "$value" || return 1
+        fi
+        printf '%s\n' "$value"
+        return 0
+    fi
+    command -v python3 >/dev/null || { err "IPv6 地址校验需要 Python 3（标准库 ipaddress）。"; return 1; }
+    python3 -I - "$kind" "$value" <<'PY'
+import ipaddress
+import socket
+import sys
+
+kind, value = sys.argv[1:]
+try:
+    if "%" in value:
+        raise ValueError
+    if kind == "cidr":
+        network = ipaddress.IPv6Network(value, strict=True)
+        if value.rpartition("/")[2] != str(network.prefixlen):
+            raise ValueError
+        print("{}/{}".format(socket.inet_ntop(socket.AF_INET6, network.network_address.packed),
+                             network.prefixlen))
+    else:
+        addr = ipaddress.IPv6Address(value)
+        if (addr.is_unspecified or addr.is_loopback or addr.is_link_local
+                or addr.is_multicast or addr.ipv4_mapped is not None):
+            raise ValueError
+        # Match the address spelling used by Linux ip and nft, including embedded IPv4.
+        print(socket.inet_ntop(socket.AF_INET6, addr.packed))
+except ValueError:
+    sys.exit(1)
+PY
+}
+
+format_endpoint() {
+    if [[ "$1" == *:* ]]; then
+        printf '[%s]:%s' "$1" "$2"
+    else
+        printf '%s:%s' "$1" "$2"
+    fi
+}
+
+parse_target() {
+    local target="$1" parsed_addr parsed_port family
+    local -n out_addr="$2" out_port="$3"
+    if [[ "$target" =~ ^\[([[:xdigit:]:.]+)\]:([0-9]+)$ ]]; then
+        parsed_addr="${BASH_REMATCH[1]}" parsed_port="${BASH_REMATCH[2]}" family=ip6
+    elif [[ "$target" =~ ^([0-9.]+):([0-9]+)$ ]]; then
+        parsed_addr="${BASH_REMATCH[1]}" parsed_port="${BASH_REMATCH[2]}" family=ip
+    else
+        return 1
+    fi
+    validate_port "$parsed_port" || return 1
+    parsed_addr="$(normalize_ip "$family" "$parsed_addr")" || return 1
+    out_addr="$parsed_addr"
+    out_port="$parsed_port"
+}
+
+family_rules() {
+    local family="$1" rule
+    local -n result="$2"
+    result=()
+    for rule in "${RULES[@]}"; do
+        if [[ "${rule%%|*}" == *:* ]]; then
+            [[ "$family" == ip6 ]] || continue
+        else
+            [[ "$family" == ip ]] || continue
+        fi
+        result+=("$rule")
+    done
+}
+
+table_families() {
+    local family
+    local -a selected
+    if (( ${#RULES[@]} == 0 && ${#CONFIG_TABLES[@]} == 0 )); then
+        printf 'ip\n'
+        return
+    fi
+    for family in ip ip6; do
+        family_rules "$family" selected
+        if (( ${#selected[@]} )) || [[ -n "${CONFIG_TABLES[$family]:-}" ]]; then
+            printf '%s\n' "$family"
+        fi
+    done
+}
+
+record_table_header() {
+    case "$1" in
+        "table ip $TABLE_NAME {") CONFIG_TABLES[ip]=1 ;;
+        "table ip6 $TABLE_NAME {") CONFIG_TABLES[ip6]=1 ;;
+        *) return 1 ;;
+    esac
+}
+
 validate_ifname() {
     local ifname="${1:-}"
     [[ "$ifname" == "*" ]] && return 0
@@ -253,9 +377,14 @@ ifname_exists() {
     [[ "$ifname" == "*" || -e "/sys/class/net/${ifname}" ]]
 }
 
-ipv4_is_local() {
-    local ip_addr="$1"
-    ip -o -4 addr show 2>/dev/null | grep -Eq "[[:space:]]${ip_addr//./\\.}/[0-9]+[[:space:]]"
+ip_is_local() {
+    local family="$1" addr="$2" flag=-4 addresses idx iface type cidr rest
+    [[ "$family" == ip6 ]] && flag=-6
+    addresses="$(ip -o "$flag" addr show 2>/dev/null)" || return 1
+    while read -r idx iface type cidr rest; do
+        [[ "${cidr%/*}" == "$addr" ]] && return 0
+    done <<< "$addresses"
+    return 1
 }
 
 ipv4_is_rfc1918() {
@@ -269,60 +398,73 @@ ipv4_is_rfc1918() {
     return 1
 }
 
-# 优先使用默认路由实际选择的源 IPv4；
-# 无默认路由时，回退到第一个非 lo 的全局 IPv4。
+# 按地址族优先使用路由选定的源地址，否则取非 lo 接口上的全局地址。
 get_local_ip() {
-    local route token want_src=0 ip_addr=""
-    local _idx _if _fam cidr _rest
-
-    if IFS= read -r route < <(ip -4 route get 1.1.1.1 2>/dev/null); then
+    local family="${1:-ip}" flag=-4 probe=1.1.1.1 route token want_src=0
+    local _idx iface _fam cidr flags
+    if [[ "$family" == ip6 ]]; then flag=-6; probe=2606:4700:4700::1111; fi
+    if route="$(ip "$flag" route get "$probe" 2>/dev/null)"; then
         for token in $route; do
             if (( want_src )); then
-                ip_addr="$token"
+                normalize_ip "$family" "$token" && return 0
                 break
             fi
-            [[ "$token" == "src" ]] && want_src=1
+            [[ "$token" == src ]] && want_src=1
         done
-        if validate_ipv4 "$ip_addr"; then
-            printf '%s\n' "$ip_addr"
-            return 0
-        fi
     fi
-
-    while read -r _idx _if _fam cidr _rest; do
-        [[ "$_if" == "lo" ]] && continue
-        ip_addr="${cidr%/*}"
-        if validate_ipv4 "$ip_addr"; then
-            printf '%s\n' "$ip_addr"
-            return 0
-        fi
-    done < <(ip -o -4 addr show scope global 2>/dev/null || true)
-
+    while read -r _idx iface _fam cidr flags; do
+        [[ "$iface" != lo && ! "$flags" =~ (tentative|dadfailed|deprecated) ]] || continue
+        normalize_ip "$family" "${cidr%/*}" && return 0
+    done < <(ip -o "$flag" addr show scope global 2>/dev/null)
     return 1
 }
 
+validate_snat_addresses() {
+    local family address canonical
+    local -a selected
+    for family in ip ip6; do
+        family_rules "$family" selected
+        if [[ "$family" == ip6 ]]; then address="$SNAT_IP6"; else address="$SNAT_IP"; fi
+        [[ -z "$address" && ${#selected[@]} == 0 ]] && continue
+        if ! canonical="$(normalize_ip "$family" "$address")" || [[ "$canonical" != "$address" ]]; then
+            err "静态 SNAT 需要有效且格式规范的 $family 出口地址。"
+            return 1
+        fi
+    done
+    return 0
+}
+
 refresh_snat_ip() {
-    local detected
-    detected="$(get_local_ip)" || {
-        err "无法获取本机默认路由出口 IPv4，不能生成静态 SNAT 配置。"
-        return 1
-    }
-    validate_ipv4 "$detected" || return 1
-    SNAT_IP="$detected"
+    local family detected ipv4="" ipv6=""
+    local -a selected
+    (( ${#RULES[@]} )) || return 0
+    for family in ip ip6; do
+        family_rules "$family" selected
+        detected=""
+        if (( ${#selected[@]} )); then
+            detected="$(get_local_ip "$family")" || {
+                err "无法获取本机 $family 出口地址，不能生成静态 SNAT 配置。"
+                return 1
+            }
+        fi
+        if [[ "$family" == ip6 ]]; then ipv6="$detected"; else ipv4="$detected"; fi
+    done
+    SNAT_IP="$ipv4"
+    SNAT_IP6="$ipv6"
 }
 
 check_snat_ip_current() {
-    local detected
-    if ! detected="$(get_local_ip)"; then
-        err "无法获取当前默认路由出口 IPv4，不能核对配置中的 LOCAL_IP。"
+    local family="${1:-ip}" detected stored="$SNAT_IP" name=LOCAL_IP
+    if [[ "$family" == ip6 ]]; then stored="$SNAT_IP6"; name=LOCAL_IP6; fi
+    if ! detected="$(get_local_ip "$family")"; then
+        err "无法获取当前 $family 出口地址，不能核对 $name。"
         return 2
     fi
-    if [[ "$SNAT_IP" != "$detected" ]]; then
-        err "配置 LOCAL_IP=${SNAT_IP}，当前默认路由出口 IPv4=${detected}。"
-        err "请使用菜单 4 检查并修复环境，重新提交现有规则。"
+    if [[ "$stored" != "$detected" ]]; then
+        err "配置 ${name}=${stored}，当前出口地址为 ${detected}。请使用菜单 4 重新提交。"
         return 1
     fi
-    info "SNAT LOCAL_IP 与当前默认路由出口 IPv4 一致：${SNAT_IP}"
+    info "SNAT $name 与当前出口地址一致：$stored"
 }
 
 # ss 监听行是否包含指定端口（避免 :80 误匹配 :8080）。
@@ -334,16 +476,18 @@ ss_listen_line_has_port() {
 # 通过 stdout 返回 TCP / UDP / TCP+UDP；未占用或无法检测时返回空并 exit 1。
 describe_local_port_occupancy() {
     local port="${1:-}" line tcp=0 udp=0
+    local -a flags=()
+    [[ "${2:-ip}" == ip6 ]] && flags=(-6)
     validate_port "$port" || return 1
     command -v ss >/dev/null 2>&1 || return 1
 
     while IFS= read -r line; do
         ss_listen_line_has_port "$port" "$line" && tcp=1 && break
-    done < <(ss -H -ltn 2>/dev/null || true)
+    done < <(ss "${flags[@]}" -H -ltn 2>/dev/null || true)
 
     while IFS= read -r line; do
         ss_listen_line_has_port "$port" "$line" && udp=1 && break
-    done < <(ss -H -lun 2>/dev/null || true)
+    done < <(ss "${flags[@]}" -H -lun 2>/dev/null || true)
 
     if (( tcp && udp )); then
         printf '%s\n' 'TCP+UDP'
@@ -360,7 +504,7 @@ describe_local_port_occupancy() {
 # 交互：本机端口已被监听时警告；继续返回 0，取消返回 1。
 confirm_continue_despite_local_port_use() {
     local port="$1" occupied="" ans
-    occupied="$(describe_local_port_occupancy "$port" 2>/dev/null)" || return 0
+    occupied="$(describe_local_port_occupancy "$port" "${2:-ip}" 2>/dev/null)" || return 0
     [[ -n "$occupied" ]] || return 0
 
     warn "本机端口 ${port} 已被占用（${occupied}）。"
@@ -380,29 +524,30 @@ can_probe_tcp_connect() {
 
 probe_tcp_connect() {
     local ip="${1:-}" port="${2:-}" wait_sec="${3:-3}"
-    validate_ipv4_basic "$ip" || return 1
+    normalize_ip "$(address_family "$ip")" "$ip" >/dev/null || return 1
     validate_port "$port" || return 1
     can_probe_tcp_connect || return 1
 
-    timeout "$wait_sec" bash -c "echo >/dev/tcp/${ip}/${port}" 2>/dev/null
+    timeout "$wait_sec" bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$ip" "$port" 2>/dev/null
 }
 
 # 交互：添加规则前探测目标 TCP；不通时确认。继续返回 0，取消返回 1。
 confirm_continue_despite_unreachable_dest() {
-    local ip="$1" port="$2" ans
+    local ip="$1" port="$2" ans endpoint
+    endpoint="$(format_endpoint "$ip" "$port")"
 
     if ! can_probe_tcp_connect; then
         warn "跳过目标连通性探测：未找到 timeout 命令。"
         return 0
     fi
 
-    info "正在探测目标 TCP ${ip}:${port}（超时 3s）..."
+    info "正在探测目标 TCP ${endpoint}（超时 3s）..."
     if probe_tcp_connect "$ip" "$port" 3; then
-        info "目标 ${ip}:${port} TCP 可达。"
+        info "目标 ${endpoint} TCP 可达。"
         return 0
     fi
 
-    warn "目标 ${ip}:${port} TCP 不通或超时（不等于 NAT 会失败；若目标仅 UDP 可忽略）。"
+    warn "目标 ${endpoint} TCP 不通或超时（不等于 NAT 会失败；若目标仅 UDP 可忽略）。"
     read_or_cancel ans "是否仍要继续添加？[y/N]: " || return 1
     answer_yes_default_no "$ans" || {
         warn "已取消。"
@@ -481,11 +626,11 @@ ensure_dirs() {
 
 # ---------- rules load/render/apply ----------
 runtime_table_exists() {
-    nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1
+    nft list table "$1" "$TABLE_NAME" >/dev/null 2>&1
 }
 
 runtime_table_is_owned() {
-    nft list chain "$TABLE_FAMILY" "$TABLE_NAME" "$OWNER_CHAIN" >/dev/null 2>&1
+    nft list chain "$1" "$TABLE_NAME" "$OWNER_CHAIN" >/dev/null 2>&1
 }
 
 rule_conflicts() {
@@ -504,11 +649,13 @@ rule_conflicts() {
 
 load_rules_from_conf() {
     local conf_path="${1:-$CONF_FILE}"
-    local line parsed_rule listen_ip lport proto dip dport iif source_cidr
-    local tmp_expected="" snat_ip_count=0
+    local line parsed_rule family listen_ip lport proto dip dport iif source_cidr rule_name
+    local tmp_expected=""
     local -a fields=()
     RULES=()
+    CONFIG_TABLES=()
     SNAT_IP=""
+    SNAT_IP6=""
     CONFIG_LOAD_ERRORS=0
 
     [[ ! -L "$conf_path" ]] || {
@@ -529,41 +676,48 @@ load_rules_from_conf() {
     }
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" =~ ^[[:space:]]*define[[:space:]]+LOCAL_IP[[:space:]]*=[[:space:]]*([0-9.]+)[[:space:]]*$ ]]; then
-            (( ++snat_ip_count ))
-            SNAT_IP="${BASH_REMATCH[1]}"
-            validate_ipv4 "$SNAT_IP" || {
-                err "配置中的 LOCAL_IP 非法：${SNAT_IP}"
-                CONFIG_LOAD_ERRORS=1
-            }
+        if [[ "$line" =~ ^define[[:space:]]+(LOCAL_IP6?)[[:space:]]*=[[:space:]]*([^[:space:]]+)$ ]]; then
+            if [[ "${BASH_REMATCH[1]}" == LOCAL_IP6 ]]; then
+                SNAT_IP6="${BASH_REMATCH[2]}"
+            else
+                SNAT_IP="${BASH_REMATCH[2]}"
+            fi
             continue
         fi
+        record_table_header "$line" && continue
         if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*RULE:[[:space:]]*(.+)[[:space:]]*$ ]]; then
             parsed_rule="${BASH_REMATCH[1]}"
             fields=()
             IFS='|' read -ra fields <<< "$parsed_rule"
 
-            if (( ${#fields[@]} != 7 )); then
-                err "配置规则必须恰好包含 7 个字段：$parsed_rule"
+            if (( ${#fields[@]} != 7 && ${#fields[@]} != 8 )); then
+                err "配置规则应包含 7 个必填字段和一个可选名称。"
                 CONFIG_LOAD_ERRORS=1
                 continue
             fi
             listen_ip="${fields[0]}"; lport="${fields[1]}"; proto="${fields[2]}"
             dip="${fields[3]}"; dport="${fields[4]}"; iif="${fields[5]}"
             source_cidr="${fields[6]}"
+            rule_name="${fields[7]:-}"
+            validate_rule_name "$rule_name" || {
+                err "配置中的规则名称包含竖线或控制字符。"
+                CONFIG_LOAD_ERRORS=1
+                continue
+            }
 
             [[ "$proto" == "tcp" || "$proto" == "udp" ]] || {
                 err "配置规则协议非法：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue
             }
-            validate_ipv4 "$listen_ip" || {
-                err "配置规则监听 IPv4 非法/特殊：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue
+            family="$(address_family "$listen_ip")"
+            listen_ip="$(normalize_ip "$family" "$listen_ip")" || {
+                err "配置规则监听 IP 非法/特殊：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue
             }
             validate_port "$lport" || { err "配置规则端口非法：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue; }
             validate_port "$dport" || { err "配置规则目标端口非法：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue; }
-            validate_ipv4 "$dip" || { err "配置规则目标 IPv4 非法/特殊：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue; }
+            dip="$(normalize_ip "$family" "$dip")" || { err "配置规则目标 IP 非法/特殊或地址族不同：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue; }
             validate_ifname "$iif" || { err "配置规则入口网卡非法：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue; }
-            validate_ipv4_cidr "$source_cidr" || {
-                err "配置规则来源 CIDR 非法：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue
+            source_cidr="$(normalize_ip "$family" "$source_cidr" cidr)" || {
+                err "配置规则来源 CIDR 非法或地址族不同：$parsed_rule"; CONFIG_LOAD_ERRORS=1; continue
             }
             if rule_conflicts "$listen_ip" "$lport" "$proto" "$iif"; then
                 err "配置存在重叠监听规则：$parsed_rule"
@@ -571,14 +725,9 @@ load_rules_from_conf() {
                 continue
             fi
 
-            RULES+=("${listen_ip}|${lport}|${proto}|${dip}|${dport}|${iif}|${source_cidr}")
+            RULES+=("${listen_ip}|${lport}|${proto}|${dip}|${dport}|${iif}|${source_cidr}${rule_name:+|$rule_name}")
         fi
     done < "$conf_path"
-
-    if (( snat_ip_count != 1 )); then
-        err "配置必须恰好包含一条 define LOCAL_IP（当前 ${snat_ip_count} 条）。"
-        CONFIG_LOAD_ERRORS=1
-    fi
 
     if (( CONFIG_LOAD_ERRORS == 0 )); then
         tmp_expected="$(mktemp)" || {
@@ -603,91 +752,89 @@ assert_loaded_config_safe() {
     }
 }
 
-render_conf_file() {
-    local output_path="$1"
-    local r listen_ip lport proto dip dport iif source_cidr
-    local iif_expr source_expr original_source_expr
+rule_expressions() {
+    local family="$1" rule="$2" view="$3"
+    local -n pre_expr="$4" post_expr="$5"
+    local listen lport proto dest dport iif cidr endpoint _rule_name
+    local ingress="" source="" original_source=""
+    local nat_action='snat to $LOCAL_IP'
+    if [[ "$family" == ip6 ]]; then nat_action='snat to $LOCAL_IP6'; fi
+    if [[ "$view" == runtime ]]; then
+        if [[ "$family" == ip6 ]]; then nat_action="snat to $SNAT_IP6"; else nat_action="snat to $SNAT_IP"; fi
+    fi
+    IFS='|' read -r listen lport proto dest dport iif cidr _rule_name <<< "$rule"
+    [[ "$iif" == "*" ]] || ingress="iifname \"${iif}\" "
+    if [[ "$cidr" != "0.0.0.0/0" && "$cidr" != "::/0" ]]; then
+        if [[ "$view" == runtime ]]; then
+            if [[ "$family" == ip6 ]]; then cidr="${cidr%/128}"; else cidr="${cidr%/32}"; fi
+        fi
+        source="$family saddr $cidr "
+        original_source="ct original $source"
+    fi
+    endpoint="$(format_endpoint "$dest" "$dport")"
+    pre_expr="${ingress}$family daddr $listen ${source}$proto dport $lport dnat to $endpoint"
+    # ct original proto-dst 需要先指定 L4 协议上下文。
+    post_expr="${ingress}ct status dnat ct original $family daddr $listen meta l4proto $proto ct original proto-dst $lport ${original_source}$family daddr $dest $proto dport $dport $nat_action"
+}
 
-    validate_ipv4 "$SNAT_IP" || {
-        err "未设置合法的 SNAT LOCAL_IP，拒绝生成配置。"
-        return 1
-    }
+render_table() {
+    local family="$1" rule dnat postnat
+    local -a selected post_lines=()
+    family_rules "$family" selected
+    printf 'add table %s %s\n' "$family" "$TABLE_NAME"
+    printf 'delete table %s %s\n\n' "$family" "$TABLE_NAME"
+    printf 'table %s %s {\n' "$family" "$TABLE_NAME"
+    printf '    chain %s {\n    }\n\n' "$OWNER_CHAIN"
+    printf '    chain %s {\n' "$CHAIN_PREROUTING"
+    printf '        type nat hook prerouting priority -100; policy accept;\n'
+    for rule in "${selected[@]}"; do
+        rule_expressions "$family" "$rule" config dnat postnat
+        printf '        # RULE: %s\n        %s\n' "$rule" "$dnat"
+        post_lines+=("        # RULE-SNAT: $rule" "        $postnat")
+    done
+    printf '    }\n\n    chain %s {\n' "$CHAIN_POSTROUTING"
+    printf '        type nat hook postrouting priority 100; policy accept;\n'
+    if (( ${#post_lines[@]} )); then printf '%s\n' "${post_lines[@]}"; fi
+    printf '    }\n}\n'
+}
+
+render_conf_file() {
+    local output_path="$1" family
+    local -a families
+    mapfile -t families < <(table_families)
+    validate_snat_addresses || return 1
 
     if ! {
         printf '%s\n' '#!/usr/sbin/nft -f'
         printf '%s\n\n' "$CONF_MAGIC"
-        printf 'define LOCAL_IP = %s\n\n' "$SNAT_IP"
-        printf 'add table %s %s\n' "$TABLE_FAMILY" "$TABLE_NAME"
-        printf 'delete table %s %s\n\n' "$TABLE_FAMILY" "$TABLE_NAME"
-        printf 'table %s %s {\n' "$TABLE_FAMILY" "$TABLE_NAME"
-        printf '    chain %s {\n' "$OWNER_CHAIN"
-        printf '    }\n\n'
-        printf '    chain %s {\n' "$CHAIN_PREROUTING"
-        printf '        type nat hook prerouting priority -100; policy accept;\n'
-
-        for r in "${RULES[@]+"${RULES[@]}"}"; do
-            IFS='|' read -r listen_ip lport proto dip dport iif source_cidr <<< "$r"
-            iif_expr=""
-            source_expr=""
-            [[ "$iif" == "*" ]] || iif_expr="iifname \"${iif}\" "
-            [[ "$source_cidr" == "0.0.0.0/0" ]] || source_expr="ip saddr ${source_cidr} "
-            printf '        # RULE: %s\n' "$r"
-            printf '        %sip daddr %s %s%s dport %s dnat to %s:%s\n' \
-                "$iif_expr" "$listen_ip" "$source_expr" "$proto" "$lport" "$dip" "$dport"
+        if [[ -z "$SNAT_IP$SNAT_IP6" ]]; then printf '# MODE: static-snat\n\n'; fi
+        if [[ -n "$SNAT_IP" ]]; then printf 'define LOCAL_IP = %s\n\n' "$SNAT_IP"; fi
+        if [[ -n "$SNAT_IP6" ]]; then printf 'define LOCAL_IP6 = %s\n\n' "$SNAT_IP6"; fi
+        for family in "${families[@]}"; do
+            render_table "$family" || return 1
         done
-
-        printf '    }\n\n'
-        printf '    chain %s {\n' "$CHAIN_POSTROUTING"
-        printf '        type nat hook postrouting priority 100; policy accept;\n'
-
-        for r in "${RULES[@]+"${RULES[@]}"}"; do
-            IFS='|' read -r listen_ip lport proto dip dport iif source_cidr <<< "$r"
-            iif_expr=""
-            original_source_expr=""
-            [[ "$iif" == "*" ]] || iif_expr="iifname \"${iif}\" "
-            [[ "$source_cidr" == "0.0.0.0/0" ]] \
-                || original_source_expr="ct original ip saddr ${source_cidr} "
-            printf '        # RULE-SNAT: %s\n' "$r"
-            # proto-dst 需要先有 L4 协议上下文，否则部分 nft 版本会报
-            # "Can't parse symbolic invalid expressions"。
-            printf '        %sct status dnat ct original ip daddr %s meta l4proto %s ct original proto-dst %s %sip daddr %s %s dport %s snat to $LOCAL_IP\n' \
-                "$iif_expr" "$listen_ip" "$proto" "$lport" "$original_source_expr" "$dip" "$proto" "$dport"
-        done
-
-        printf '    }\n'
-        printf '}\n'
     } > "$output_path"; then
         err "生成 nft 配置失败：${output_path}"
         return 1
     fi
-
-    [[ -s "$output_path" ]] || { err "生成的 nft 配置为空：${output_path}"; return 1; }
     grep -Fqx "$CONF_MAGIC" "$output_path" || return 1
-    grep -Fq "table ${TABLE_FAMILY} ${TABLE_NAME} {" "$output_path" || return 1
-    return 0
+    for family in "${families[@]}"; do
+        grep -Fqx "table $family $TABLE_NAME {" "$output_path" || return 1
+    done
 }
 
 runtime_rules_match_loaded_config() {
-    local runtime_output="$1" line chain="" key count
-    local r listen_ip lport proto dip dport iif source_cidr
-    local iif_expr source_expr original_source_expr
+    local runtime_output="$1" family="${2:-ip}" line chain="" key count rule dnat postnat
     local table_seen=0 owner_seen=0 prerouting_seen=0 postrouting_seen=0
     local prerouting_type_seen=0 postrouting_type_seen=0
     local -A expected=() seen=()
+    local -a selected
 
-    for r in "${RULES[@]+"${RULES[@]}"}"; do
-        IFS='|' read -r listen_ip lport proto dip dport iif source_cidr <<< "$r"
-        iif_expr=""
-        source_expr=""
-        original_source_expr=""
-        [[ "$iif" == "*" ]] || iif_expr="iifname \"${iif}\" "
-        [[ "$source_cidr" == "0.0.0.0/0" ]] || {
-            # nft list 会将 a.b.c.d/32 显示为裸地址；%/32 仅移除该后缀。
-            source_expr="ip saddr ${source_cidr%/32} "
-            original_source_expr="ct original ip saddr ${source_cidr%/32} "
-        }
-        expected["${CHAIN_PREROUTING}|${iif_expr}ip daddr ${listen_ip} ${source_expr}${proto} dport ${lport} dnat to ${dip}:${dport}"]=1
-        expected["${CHAIN_POSTROUTING}|${iif_expr}ct status dnat ct original ip daddr ${listen_ip} meta l4proto ${proto} ct original proto-dst ${lport} ${original_source_expr}ip daddr ${dip} ${proto} dport ${dport} snat to ${SNAT_IP}"]=1
+    family_rules "$family" selected
+    for rule in "${selected[@]}"; do
+        rule_expressions "$family" "$rule" runtime dnat postnat
+        expected["${CHAIN_PREROUTING}|$dnat"]=1
+        expected["${CHAIN_POSTROUTING}|$postnat"]=1
     done
 
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -695,7 +842,7 @@ runtime_rules_match_loaded_config() {
         line="${line%"${line##*[![:space:]]}"}"
         [[ -n "$line" ]] || continue
         case "$line" in
-            "table ${TABLE_FAMILY} ${TABLE_NAME} {") (( ++table_seen )); chain="" ;;
+            "table ${family} ${TABLE_NAME} {") (( ++table_seen )); chain="" ;;
             "chain ${OWNER_CHAIN} {") (( ++owner_seen )); chain="$OWNER_CHAIN" ;;
             "chain ${CHAIN_PREROUTING} {") (( ++prerouting_seen )); chain="$CHAIN_PREROUTING" ;;
             "chain ${CHAIN_POSTROUTING} {") (( ++postrouting_seen )); chain="$CHAIN_POSTROUTING" ;;
@@ -730,21 +877,39 @@ runtime_rules_match_loaded_config() {
     return 0
 }
 
+runtime_table_matches_loaded_config() {
+    local family="$1" output
+    output="$(nft -nn list table "$family" "$TABLE_NAME" 2>/dev/null | normalize_runtime_nft_dump "$family")" \
+        || return 1
+    runtime_rules_match_loaded_config "$output" "$family"
+}
+
 check_runtime_ownership() {
-    runtime_table_exists || return 0
-    runtime_table_is_owned && return 0
-    err "运行中已有未标记的 table ${TABLE_FAMILY} ${TABLE_NAME}；拒绝接管。"
-    return 1
+    local family tables
+    tables="$(nft list tables)" || { err "无法读取运行表列表。"; return 1; }
+    while read -r family; do
+        grep -Fxq "table $family $TABLE_NAME" <<< "$tables" || continue
+        runtime_table_is_owned "$family" || {
+            err "运行中已有未标记的 table $family $TABLE_NAME；拒绝接管。"
+            return 1
+        }
+    done < <(table_families)
 }
 
 # nft list 可能省略 meta l4proto；重新加载时 ct original proto-dst
 # 没有 L4 上下文会报 "Can't parse symbolic invalid expressions"。
 normalize_runtime_nft_dump() {
-    local line proto
+    local family="${1:-ip}" line proto bits=32 host_pattern
+    [[ "$family" == ip6 ]] && bits=128
+    host_pattern="($family saddr [[:xdigit:].:]+)/$bits([[:space:]]|$)"
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # 某些 nft 版本会显式输出 NAT 地址族；在 table ip 中语义相同。
-        line="${line// dnat ip to / dnat to }"
-        line="${line// snat ip to / snat to }"
+        # nft -nn 可将 conntrack 的 DNAT 状态位显示为十六进制。
+        line="${line//ct status 0x20 /ct status dnat }"
+        line="${line// dnat $family to / dnat to }"
+        line="${line// snat $family to / snat to }"
+        if [[ "$line" =~ $host_pattern ]]; then
+            line="${line/"${BASH_REMATCH[1]}/$bits"/"${BASH_REMATCH[1]}"}"
+        fi
         if [[ "$line" == *"ct original proto-dst"* && "$line" != *"meta l4proto"* ]]; then
             if [[ "$line" =~ [[:space:]](tcp|udp)[[:space:]]+dport[[:space:]] ]]; then
                 proto="${BASH_REMATCH[1]}"
@@ -756,18 +921,19 @@ normalize_runtime_nft_dump() {
 }
 
 build_runtime_rollback() {
-    local output_path="$1"
-    if ! {
+    local output_path="$1" family tables
+    tables="$(nft list tables)" || return 1
+    {
         printf '%s\n\n' '#!/usr/sbin/nft -f'
-        printf 'add table %s %s\n' "$TABLE_FAMILY" "$TABLE_NAME"
-        printf 'delete table %s %s\n\n' "$TABLE_FAMILY" "$TABLE_NAME"
-        if runtime_table_exists; then
-            nft list table "$TABLE_FAMILY" "$TABLE_NAME" | normalize_runtime_nft_dump
-        fi
-    } > "$output_path"; then
-        err "生成运行态回滚文件失败。"
-        return 1
-    fi
+        while read -r family; do
+            printf 'add table %s %s\n' "$family" "$TABLE_NAME"
+            printf 'delete table %s %s\n\n' "$family" "$TABLE_NAME"
+            if grep -Fxq "table $family $TABLE_NAME" <<< "$tables"; then
+                runtime_table_is_owned "$family" || return 1
+                nft -nn list table "$family" "$TABLE_NAME" | normalize_runtime_nft_dump "$family" || return 1
+            fi
+        done < <(table_families)
+    } > "$output_path" || { err "生成运行态回滚文件失败。"; return 1; }
     run_nft -c -f "$output_path" || {
         err "运行态回滚文件校验失败。"
         return 1
@@ -784,6 +950,43 @@ apply_nft_file() {
 cleanup_transaction_files() {
     rm -f "$TXN_CANDIDATE" "$TXN_ROLLBACK" || return 1
     rm -f "$TXN_MARKER"
+}
+
+repair_runtime_interactive() {
+    local family ans
+    local -a mismatched=()
+    while read -r family; do
+        if ! runtime_table_matches_loaded_config "$family"; then
+            mismatched+=("$family $TABLE_NAME")
+        fi
+    done < <(table_families)
+    (( ${#mismatched[@]} )) || return 0
+
+    warn "以下运行表缺失或与配置不一致。"
+    for family in "${mismatched[@]}"; do
+        warn "  table $family"
+    done
+    read_or_cancel ans "是否按正式配置恢复托管运行表？[Y/n]: " || return 1
+    answer_yes_default_yes "$ans" || return 1
+
+    if [[ -e "$TXN_MARKER" || -L "$TXN_MARKER" ]]; then
+        err "存在未恢复的规则事务，请重新启动脚本执行恢复。"
+        return 1
+    fi
+    secure_root_file "$CONF_FILE" && load_rules_from_conf || return 1
+    check_runtime_ownership || return 1
+    apply_nft_file "$CONF_FILE" || {
+        err "加载托管配置失败。"
+        return 1
+    }
+
+    while read -r family; do
+        if ! runtime_table_matches_loaded_config "$family"; then
+            err "重新加载后，table $family $TABLE_NAME 仍未通过规则比对。"
+            return 1
+        fi
+    done < <(table_families)
+    info "托管运行表已恢复，并通过规则比对。"
 }
 
 recover_incomplete_transaction() {
@@ -853,6 +1056,8 @@ commit_rules() {
         return 1
     fi
 
+    local family
+    while read -r family; do CONFIG_TABLES[$family]=1; done < <(table_families)
     finish_committed_transaction
     return 0
 }
@@ -865,12 +1070,12 @@ finish_committed_transaction() {
 }
 
 get_ip_forward_value() {
-    sysctl -n net.ipv4.ip_forward 2>/dev/null
+    sysctl -n "${FORWARD_KEYS[${1:-ip}]}" 2>/dev/null
 }
 
 get_ip_forward_display() {
     local value
-    if value="$(get_ip_forward_value)"; then
+    if value="$(get_ip_forward_value "${1:-ip}")"; then
         printf '%s\n' "$value"
     else
         printf '%s\n' 'unknown'
@@ -879,63 +1084,64 @@ get_ip_forward_display() {
 
 # ---------- ip forward controls ----------
 enable_ip_forward_runtime() {
-    local cur
-    cur="$(get_ip_forward_value)" || {
-        err "无法读取 net.ipv4.ip_forward"
-        return 1
-    }
-    if [[ "$cur" != "1" ]]; then
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null \
-            || { err "无法开启 net.ipv4.ip_forward"; return 1; }
-        info "已临时开启 net.ipv4.ip_forward=1"
+    local family="${1:-ip}" cur key
+    key="${FORWARD_KEYS[$family]}"
+    cur="$(get_ip_forward_value "$family")" || { err "无法读取 $key"; return 1; }
+    if [[ "$cur" != 1 ]]; then
+        sysctl -w "$key=1" >/dev/null || { err "无法开启 $key"; return 1; }
+        info "已临时开启 $key=1"
     else
-        info "net.ipv4.ip_forward 已经是 1"
+        info "$key 已经是 1"
     fi
 }
 
 enable_ip_forward_persist() {
-    local cur tmp sysctl_dir
-    sysctl_dir="$(dirname "$SYSCTL_FILE")"
+    local family="${1:-ip}" cur tmp sysctl_dir key path
+    key="${FORWARD_KEYS[$family]}"
+    path="${FORWARD_FILES[$family]}"
+    sysctl_dir="$(dirname "$path")"
     ensure_secure_dir "$sysctl_dir" 0755
-    [[ ! -L "$SYSCTL_FILE" ]] || { err "拒绝写入符号链接：${SYSCTL_FILE}"; return 1; }
-    tmp="$(mktemp "${SYSCTL_FILE}.tmp.XXXXXX")" || return 1
-    if ! printf '%s\n' 'net.ipv4.ip_forward=1' > "$tmp"; then
+    [[ ! -L "$path" ]] || { err "拒绝写入符号链接：${path}"; return 1; }
+    tmp="$(mktemp "${path}.tmp.XXXXXX")" || return 1
+    if ! printf '%s\n' "$key=1" > "$tmp"; then
         rm -f "$tmp" || true
         return 1
     fi
     chmod 0644 "$tmp" || { rm -f "$tmp" || true; return 1; }
     if ! sysctl -p "$tmp" >/dev/null 2>&1; then
         rm -f "$tmp" || true
-        err "应用 IPv4 转发参数失败，未写入持久化文件。"
+        err "应用 ${key} 失败，未写入持久化文件。"
         return 1
     fi
-    cur="$(get_ip_forward_value)" || {
+    cur="$(get_ip_forward_value "$family")" || {
         rm -f "$tmp" || true
-        err "无法读取 net.ipv4.ip_forward，未提交持久化文件。"
+        err "无法读取 ${key}，未提交持久化文件。"
         return 1
     }
     if [[ "$cur" != "1" ]]; then
         rm -f "$tmp" || true
-        err "临时应用后 net.ipv4.ip_forward=${cur}，未提交持久化文件。"
+        err "临时应用后 ${key}=${cur}，未提交持久化文件。"
         return 1
     fi
-    if ! mv -f "$tmp" "$SYSCTL_FILE"; then
+    if ! mv -f "$tmp" "$path"; then
         rm -f "$tmp" || true
         err "提交持久化 sysctl 文件失败。"
         return 1
     fi
-    info "已写入并应用持久化参数: $SYSCTL_FILE"
-    info "当前 net.ipv4.ip_forward = 1"
+    info "已写入并应用持久化参数: $path"
+    info "当前 ${key} = 1"
 }
 
 ip_forward_is_persisted() {
-    secure_root_file "$SYSCTL_FILE" || return 1
-    grep -Eq '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1[[:space:]]*$' "$SYSCTL_FILE"
+    local family="${1:-ip}" path
+    path="${FORWARD_FILES[$family]}"
+    secure_root_file "$path" && [[ "$(last_ip_forward_assignment "$path" "$family")" == 1 ]]
 }
 
 last_ip_forward_assignment() {
-    local path="$1" line value
-    line="$(grep -E '^[[:space:]]*-?[[:space:]]*net[./]ipv4[./]ip_forward[[:space:]]*=' "$path" 2>/dev/null | tail -n 1)" \
+    local path="$1" family="${2:-ip}" line value key
+    key="${FORWARD_KEYS[$family]}"
+    line="$(grep -E "^[[:space:]]*-?[[:space:]]*${key//./[./]}[[:space:]]*=" "$path" 2>/dev/null | tail -n 1)" \
         || return 1
     [[ -n "$line" ]] || return 1
     value="${line#*=}"
@@ -946,7 +1152,7 @@ last_ip_forward_assignment() {
 }
 
 ip_forward_has_competing_persistence() {
-    local dir path base value systemd_config systemd_sysctl=""
+    local family="${1:-ip}" dir path base value systemd_config systemd_sysctl=""
     local effective_value="" effective_source=""
     local -a names=()
     local -A selected=()
@@ -961,9 +1167,9 @@ ip_forward_has_competing_persistence() {
 
     if [[ -n "$systemd_sysctl" ]] \
         && systemd_config="$("$systemd_sysctl" --cat-config 2>/dev/null)" \
-        && value="$(last_ip_forward_assignment <(printf '%s\n' "$systemd_config"))"; then
+        && value="$(last_ip_forward_assignment <(printf '%s\n' "$systemd_config") "$family")"; then
         if [[ "$value" != "1" ]]; then
-            warn "systemd-sysctl 合并后的 IPv4 forwarding 持久化值为 ${value}"
+            warn "systemd-sysctl 合并后的 ${FORWARD_KEYS[$family]} 持久化值为 ${value}"
             return 0
         fi
         return 1
@@ -984,7 +1190,7 @@ ip_forward_has_competing_persistence() {
         for base in "${names[@]}"; do
             path="${selected[$base]}"
             [[ -f "$path" ]] || continue
-            if value="$(last_ip_forward_assignment "$path")"; then
+            if value="$(last_ip_forward_assignment "$path" "$family")"; then
                 effective_value="$value"
                 effective_source="$path"
             fi
@@ -992,163 +1198,85 @@ ip_forward_has_competing_persistence() {
     fi
 
     # procps sysctl --system applies this legacy file after sysctl.d.
-    if [[ -f /etc/sysctl.conf ]] && value="$(last_ip_forward_assignment /etc/sysctl.conf)"; then
+    if [[ -f /etc/sysctl.conf ]] && value="$(last_ip_forward_assignment /etc/sysctl.conf "$family")"; then
         effective_value="$value"
         effective_source="/etc/sysctl.conf"
     fi
 
     if [[ -n "$effective_value" && "$effective_value" != "1" ]]; then
-        warn "IPv4 forwarding 的最终持久化值为 ${effective_value}（来自 ${effective_source}）"
+        warn "${FORWARD_KEYS[$family]} 的最终持久化值为 ${effective_value}（来自 ${effective_source}）"
         return 0
     fi
     return 1
 }
 
+warn_ipv6_ra_forwarding() {
+    if [[ "$1" == ip6 && -n "$(ip -6 route show default proto ra 2>/dev/null)" ]]; then
+        warn "当前 IPv6 默认路由来自 RA。开启转发后，上联网卡需要 accept_ra=2 才能继续接收该路由。"
+    fi
+}
+
 plan_ip_forward_for_add() {
-    local cur ans
+    local family="${1:-ip}" cur ans key
+    key="${FORWARD_KEYS[$family]}"
     IPF_WANT_ENABLE=0
     IPF_WANT_PERSIST=0
-    cur="$(get_ip_forward_value)" || {
-        err "无法读取 net.ipv4.ip_forward，已取消添加规则。"
-        return 1
-    }
+    cur="$(get_ip_forward_value "$family")" || { err "无法读取 $key，已取消添加规则。"; return 1; }
     IPF_ORIGINAL_RUNTIME="$cur"
-
     if [[ "$cur" != "1" ]]; then
-        echo
-        warn "检测到 net.ipv4.ip_forward != 1"
-        read_or_cancel ans "提交规则后是否开启 IPv4 转发？[Y/n]: " || return 1
-        answer_yes_default_yes "$ans" || {
-            warn "未开启 IPv4 转发，已取消添加规则。"
-            return 1
-        }
+        warn "检测到 $key != 1"
+        warn_ipv6_ra_forwarding "$family"
+        read_or_cancel ans "提交规则后是否开启 $key？[Y/n]: " || return 1
+        answer_yes_default_yes "$ans" || { warn "已取消添加规则。"; return 1; }
         IPF_WANT_ENABLE=1
     fi
-
-    if ! ip_forward_is_persisted; then
-        read_or_cancel ans "是否持久化到 ${SYSCTL_FILE}？[y/N]: " || return 1
+    if ! ip_forward_is_persisted "$family"; then
+        read_or_cancel ans "是否持久化到 ${FORWARD_FILES[$family]}？[y/N]: " || return 1
         answer_yes_default_no "$ans" && IPF_WANT_PERSIST=1
     fi
+    return 0
 }
 
-plan_nftables_enable_for_add() {
+plan_nftables_enable() {
     local ans
     NFT_WANT_ENABLE=0
-    command -v systemctl >/dev/null 2>&1 || return 0
-    if systemctl is-enabled --quiet nftables 2>/dev/null; then
+    if nftables_is_enabled_at_boot || ! nftables_service_uses_main_conf || ! main_conf_has_include; then
         return 0
     fi
-    read_or_cancel ans "是否启用 nftables.service（systemctl enable --now）？[y/N]: " || return 1
-    answer_yes_default_no "$ans" && NFT_WANT_ENABLE=1
-    return 0
+    read_or_cancel ans "是否将 nftables.service 设为开机自启？[y/N]: " || return 1
+    if answer_yes_default_no "$ans"; then NFT_WANT_ENABLE=1; fi
 }
 
-enable_nftables_service() {
-    warn "将执行 systemctl enable --now nftables；请确认本机以 nftables 为唯一防火墙。"
-    if ! main_conf_has_include; then
-        warn "${MAIN_CONF} 尚未 include ${INCLUDE_GLOB}；启动后可能无法加载本脚本规则（可用菜单 4 修复）。"
-    fi
-    systemctl enable --now nftables || {
-        err "启用/启动 nftables.service 失败。"
-        return 1
-    }
-    info "nftables.service 已启用并启动。"
-    nftables_service_uses_main_conf \
-        || warn "nftables.service 未明确引用 ${MAIN_CONF}；请人工核对开机加载入口。"
-    return 0
-}
-
-restart_or_enable_nftables_service() {
-    command -v systemctl >/dev/null 2>&1 || {
-        err "未发现 systemctl，无法启用/重启 nftables.service。"
-        return 1
-    }
-    if systemctl is-enabled --quiet nftables 2>/dev/null; then
-        warn "将执行 systemctl restart nftables；请确认本机以 nftables 为唯一防火墙。"
-        if ! main_conf_has_include; then
-            warn "${MAIN_CONF} 尚未 include ${INCLUDE_GLOB}；重启后可能无法加载本脚本规则（可用菜单 4 修复）。"
-        fi
-        systemctl restart nftables || {
-            err "重启 nftables.service 失败。"
-            return 1
-        }
-        info "nftables.service 已重启。"
-        nftables_service_uses_main_conf \
-            || warn "nftables.service 未明确引用 ${MAIN_CONF}；请人工核对开机加载入口。"
-        return 0
-    fi
-    enable_nftables_service
-}
-
-# 统计运行态 prerouting 中的 DNAT 条数；表/链不存在时输出 0 并返回失败。
-count_runtime_dnat_rules() {
-    local output line n=0
-    if ! output="$(nft -nn list chain "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_PREROUTING" 2>/dev/null)"; then
-        printf '%s\n' 0
+enable_nftables_at_boot() {
+    if ! nftables_service_uses_main_conf || ! main_conf_has_include || ! secure_root_file "$MAIN_CONF"; then
+        err "请先确认 nftables.service 从 ${MAIN_CONF} 加载托管配置。"
         return 1
     fi
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" == *" dnat to "* ]] && (( ++n ))
-    done <<< "$output"
-    printf '%s\n' "$n"
-    return 0
-}
-
-# 配置有规则，但 nftables 未启用/未运行，或运行态 DNAT 数量与配置不一致时，提示启用或重启（默认 Y）。
-maybe_prompt_nftables_enable_or_restart() {
-    local ans conf_count runtime_count=0
-    local -a reasons=()
-
-    conf_count="${#RULES[@]}"
-    (( conf_count > 0 )) || return 0
-
-    if command -v systemctl >/dev/null 2>&1; then
-        if ! systemctl is-enabled --quiet nftables 2>/dev/null; then
-            reasons+=("nftables.service 未开机自启")
-        fi
-        if ! systemctl is-active --quiet nftables 2>/dev/null; then
-            reasons+=("nftables.service 未运行")
-        fi
+    run_nft -c -f "$MAIN_CONF" || return 1
+    systemctl enable nftables || return 1
+    if ! nftables_is_enabled_at_boot; then
+        err "未能验证 nftables.service 已永久启用。"
+        return 1
     fi
-
-    if ! runtime_count="$(count_runtime_dnat_rules)"; then
-        runtime_count=0
-        reasons+=("运行表缺失或不可读（配置 ${conf_count} 条）")
-    elif (( runtime_count != conf_count )); then
-        reasons+=("规则数量不一致：配置 ${conf_count} 条，运行态 DNAT ${runtime_count} 条")
-    fi
-
-    (( ${#reasons[@]} > 0 )) || return 0
-
-    echo
-    warn "检测到配置有规则，但 nftables 状态异常："
-    local r
-    for r in "${reasons[@]}"; do
-        warn "  - ${r}"
-    done
-    read_or_cancel ans "是否启用/重启 nftables.service？[Y/n]: " || return 0
-    answer_yes_default_yes "$ans" || {
-        warn "已跳过启用/重启 nftables.service。"
-        return 0
-    }
-    restart_or_enable_nftables_service
+    info "nftables.service 已设为开机自启。"
 }
 
 apply_nftables_enable_plan() {
     (( NFT_WANT_ENABLE )) || return 0
-    enable_nftables_service
+    enable_nftables_at_boot
 }
 
 apply_ip_forward_plan() {
+    local family="${1:-ip}"
     if (( IPF_WANT_ENABLE )); then
-        enable_ip_forward_runtime || {
-            restore_ip_forward_runtime_after_failure
+        enable_ip_forward_runtime "$family" || {
+            restore_ip_forward_runtime_after_failure "$family"
             return 1
         }
     fi
     if (( IPF_WANT_PERSIST )); then
-        enable_ip_forward_persist || {
-            restore_ip_forward_runtime_after_failure
+        enable_ip_forward_persist "$family" || {
+            restore_ip_forward_runtime_after_failure "$family"
             return 1
         }
     fi
@@ -1156,17 +1284,18 @@ apply_ip_forward_plan() {
 }
 
 restore_ip_forward_runtime_after_failure() {
-    local current
-    current="$(get_ip_forward_value)" || {
-        err "无法读取 net.ipv4.ip_forward，不能确认是否需要恢复。"
+    local family="${1:-ip}" current key
+    key="${FORWARD_KEYS[$family]}"
+    current="$(get_ip_forward_value "$family")" || {
+        err "无法读取 ${key}，不能确认是否需要恢复。"
         return 1
     }
     [[ "$current" == "$IPF_ORIGINAL_RUNTIME" ]] && return 0
-    sysctl -w "net.ipv4.ip_forward=${IPF_ORIGINAL_RUNTIME}" >/dev/null 2>&1 || {
-        err "无法恢复 net.ipv4.ip_forward=${IPF_ORIGINAL_RUNTIME}，请立即人工检查。"
+    sysctl -w "${key}=${IPF_ORIGINAL_RUNTIME}" >/dev/null 2>&1 || {
+        err "无法恢复 ${key}=${IPF_ORIGINAL_RUNTIME}，请立即人工检查。"
         return 1
     }
-    warn "已恢复操作前的 net.ipv4.ip_forward=${IPF_ORIGINAL_RUNTIME}"
+    warn "已恢复操作前的 ${key}=${IPF_ORIGINAL_RUNTIME}"
 }
 
 add_include_to_main_conf() {
@@ -1182,7 +1311,7 @@ add_include_to_main_conf() {
     fi
 
     if main_conf_has_include; then
-        info "${MAIN_CONF} 已存在 include，无需重复添加。"
+        info "${MAIN_CONF} 已包含托管配置。"
         return 0
     fi
 
@@ -1237,61 +1366,22 @@ check_include_hint() {
             return 1
         }
         if main_conf_has_include; then
-            info "${MAIN_CONF} 已包含 ${INCLUDE_GLOB}"
-        else
-            warn "${MAIN_CONF} 未发现 ${INCLUDE_LINE}"
-            warn "将最小化修改系统主配置：仅追加一行 include，并做语法校验（失败会回滚）。"
-            read_or_cancel ans "是否现在向 ${MAIN_CONF} 追加 include？[y/N]: " || return 0
-            if answer_yes_default_no "$ans"; then
-                add_include_to_main_conf || { err "补充 include 失败。"; return 1; }
-            else
-                warn "已跳过修改 ${MAIN_CONF}。持久化可能不完整，建议稍后执行菜单 4。"
-            fi
-        fi
-    else
-        warn "${MAIN_CONF} 不存在。"
-        read_or_cancel ans "是否现在创建 ${MAIN_CONF} 并加入 include？[Y/n]: " || return 0
-        if answer_yes_default_yes "$ans"; then
-            add_include_to_main_conf || { err "创建 ${MAIN_CONF} 失败。"; return 1; }
-        else
-            warn "已跳过创建 ${MAIN_CONF}，持久化可能不完整。"
+            info "${MAIN_CONF} 已包含托管配置。"
             return 0
         fi
-    fi
-
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-enabled --quiet nftables 2>/dev/null; then
-            info "nftables.service 已设为开机自启。"
-            nftables_service_uses_main_conf \
-                || warn "nftables.service 未明确引用 ${MAIN_CONF}；当前发行版持久化入口可能不同。"
-        else
-            warn_nftables_service_not_enabled
-        fi
+        warn "${MAIN_CONF} 缺少托管 include。"
+        read_or_cancel ans "是否追加 include？[y/N]: " || return 0
+        answer_yes_default_no "$ans" || return 0
     else
-        warn "未发现 systemctl；请按当前 init 系统人工确认 nftables 开机加载入口。"
+        warn "${MAIN_CONF} 不存在。"
+        read_or_cancel ans "是否创建 ${MAIN_CONF} 并加入 include？[Y/n]: " || return 0
+        answer_yes_default_yes "$ans" || return 0
     fi
+    add_include_to_main_conf
 }
 
 # ---------- diagnostics & help ----------
-check_forward_status() {
-    echo
-    info "=== 环境快检 ==="
-
-    local ipf
-    if ! ipf="$(get_ip_forward_value)"; then
-        warn "无法读取 net.ipv4.ip_forward"
-    elif [[ "$ipf" == "1" ]]; then
-        info "ip_forward = 1"
-    else
-        warn "ip_forward = ${ipf}（转发可能不通）"
-    fi
-
-    if nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1; then
-        info "表 ${TABLE_FAMILY} ${TABLE_NAME} 已加载"
-    else
-        warn "表 ${TABLE_FAMILY} ${TABLE_NAME} 未加载"
-    fi
-
+show_forward_filter_hints() {
     local other_fw=0
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
         warn "firewalld 运行中，可能拦截转发或与本脚本规则冲突"
@@ -1315,19 +1405,20 @@ show_tips() {
 脚本: ${SCRIPT_BASENAME}
 
 使用说明：
-1. 模式固定为 DNAT + 静态 SNAT；使用本机默认路由出口 IPv4 作为 LOCAL_IP。
-   配置写入 define LOCAL_IP，后端看不到真实客户端 IP；出口地址变化后可用菜单 4 检查并修复。
-2. 添加时必须明确监听 IPv4（可按序号选本机地址），并可限制来源 CIDR / 入口网卡。
+1. 模式固定为 DNAT + 静态 SNAT；按地址族使用默认路由选定的源地址。
+   IPv4 写入 LOCAL_IP，IPv6 写入 LOCAL_IP6，后端看不到真实客户端 IP；出口地址变化后可用菜单 4 检查并修复。
+2. 目标可填 IPv4:端口 或 [IPv6]:端口。监听地址和来源 CIDR 使用目标的地址族，可限制入口网卡。
    云厂商若公网 IP 未挂在网卡上，请选内网 IP（包到达本机时的目的地址）。
    若本机端口已被服务占用，会警告并请你确认。
    输入目标后会做一次 TCP 连通探测；不通可确认后仍继续。
 3. 删除时按列表序号；可用空格或逗号多选（如 1 3 5 或 1,3,5）；
    也支持 n+（第 n 与 n+1 条）、n-（第 n 与 n-1 条）；越界邻居会跳过并警告；输入 all 可清空。
-4. 菜单 4 可检查/修复 include 与 ip_forward；添加规则时可选择启用 nftables.service（默认否）。
+4. 菜单 4 可恢复托管运行表并复查内核转发和开机加载；开机自启需单独确认（默认否）。
    --check 只做运行态/持久化校验，不对目标做网络探测。
+5. 添加规则时可填写名称，菜单 2 和 3 会显示名称。菜单 5 可按序号补填、修改或清除名称。
 
 安全边界：
-1. 仅管理 table ${TABLE_FAMILY} ${TABLE_NAME}。
+1. 按地址族管理 table ip ${TABLE_NAME} 和 table ip6 ${TABLE_NAME}。
 2. 不自动改 firewalld / ufw / iptables。
 3. 持久化依赖 ${MAIN_CONF} 包含: include "/etc/nftables.d/*.conf"
 
@@ -1338,22 +1429,23 @@ show_tips() {
 
   # 规则查看 / 校验
   nft list table ${TABLE_FAMILY} ${TABLE_NAME}
-  nft -nn list table ${TABLE_FAMILY} ${TABLE_NAME}
+  nft -nn list table ip6 ${TABLE_NAME}
   grep -E 'RULE:|RULE-SNAT:' ${CONF_FILE}
   nft -c -f ${CONF_FILE}
 
   # 转发与持久化
-  sysctl net.ipv4.ip_forward
-  cat ${SYSCTL_FILE}
+  sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
+  cat ${SYSCTL_FILE} ${FORWARD_FILES[ip6]}
   grep -nE 'include.*/etc/nftables\\.d' ${MAIN_CONF}
 
   # nftables 开机加载（确认无 firewalld/ufw 抢管后再启用）
-  systemctl enable --now nftables
+  systemctl enable nftables
   systemctl status nftables
   nft list ruleset
 
   # 排障
   ip -4 addr show scope global
+  ip -6 addr show scope global
   ss -lntup
   systemctl is-active firewalld 2>/dev/null; ufw status 2>/dev/null
 
@@ -1378,10 +1470,11 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION} (static-snat)
     --check-strict   严格检查；持久化问题也返回失败
 
 说明:
+    - 目标支持 IPv4:端口 或 [IPv6]:端口，例如 [2001:db8::2]:443；IPv6 地址校验需要 python3
     - 默认进入交互菜单模式
-    - 模式固定为 DNAT + 静态 SNAT；LOCAL_IP 取默认路由实际选择的源 IPv4
-    - 配置使用 snat to \$LOCAL_IP；加载后的运行态会显示展开后的具体 IPv4
-    - --check 会检测配置 LOCAL_IP 与当前出口 IPv4 是否发生漂移
+    - 模式固定为 DNAT + 静态 SNAT；LOCAL_IP / LOCAL_IP6 分别取相应地址族的出口地址
+    - 加载后的运行态显示展开后的具体 SNAT 地址
+    - --check 会检测配置中的静态 SNAT 地址与当前出口地址 是否发生漂移
     - 菜单与两种 --check 需要 root 权限；--help/--version 不需要
     - 健康检查不修改系统配置
 
@@ -1395,7 +1488,8 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION} (static-snat)
     ${MAIN_CONF}.bak.XXXXXX
         修改已有主配置前的一次性备份（成功后保留；已有 include 时不再生成）
     ${SYSCTL_FILE}
-        仅在确认持久化时写入 net.ipv4.ip_forward=1
+    ${FORWARD_FILES[ip6]}
+        按地址族在确认持久化时写入对应的转发开关
     ${RUNTIME_DIR}/
     ${LOCK_FILE}
         运行时互斥锁（通常位于 /run，重启后消失）
@@ -1403,8 +1497,8 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION} (static-snat)
     ${TXN_ROLLBACK}
     ${TXN_MARKER}
         提交事务中间文件；正常成功后清理，异常时可能残留供恢复/排查
-    运行态 table ${TABLE_FAMILY} ${TABLE_NAME}
-        以及可选的 net.ipv4.ip_forward=1（内核，非文件）
+    运行态 table ip ${TABLE_NAME} / table ip6 ${TABLE_NAME}
+        以及对应的 IPv4 / IPv6 内核转发设置
 
 不会自动改动: firewalld / ufw / iptables、BBR；
 添加规则时可选择启用 nftables.service（默认否）。
@@ -1414,7 +1508,8 @@ EOF
 
 run_health_check() {
     local mode="${1:-check}" status=0 persistence_status=0
-    local ipf runtime_output="" config_ok=0
+    local ipf config_ok=0
+    local -A checked_tables=()
 
     echo "========================================"
     echo " ${SCRIPT_DISPLAY_NAME} 健康检查"
@@ -1430,9 +1525,9 @@ run_health_check() {
         persistence_status=1
     fi
     if main_conf_has_include; then
-        info "[持久化] ${MAIN_CONF} 已包含 ${INCLUDE_GLOB}"
+        info "[持久化] ${MAIN_CONF} 已包含托管配置。"
     else
-        warn "[持久化] ${MAIN_CONF} 未包含 ${INCLUDE_GLOB}"
+        warn "[持久化] ${MAIN_CONF} 缺少托管 include。"
         persistence_status=1
     fi
 
@@ -1445,65 +1540,60 @@ run_health_check() {
         status=1
     fi
 
-    if (( config_ok && ${#RULES[@]} > 0 )); then
-        check_snat_ip_current || status=1
-        if ! ipf="$(get_ip_forward_value)"; then
-            err "无法读取 net.ipv4.ip_forward"
-            status=1
-        elif [[ "$ipf" == "1" ]]; then
-            info "net.ipv4.ip_forward = 1"
-        else
-            err "net.ipv4.ip_forward = ${ipf}"
-            status=1
-        fi
-        if ip_forward_is_persisted; then
-            if ip_forward_has_competing_persistence; then
-                warn "[持久化] IPv4 forwarding 合并后的最终值不是 1。"
+    local family key
+    local -a selected
+    while read -r family; do
+        checked_tables[$family]=1
+        key="${FORWARD_KEYS[$family]}"
+        family_rules "$family" selected
+        if (( config_ok && ${#selected[@]} )); then
+            check_snat_ip_current "$family" || status=1
+            if ipf="$(get_ip_forward_value "$family")" && [[ "$ipf" == 1 ]]; then
+                info "$key = 1"
+            else
+                err "$key = ${ipf:-unknown}"
+                status=1
+            fi
+            if ! ip_forward_is_persisted "$family" || ip_forward_has_competing_persistence "$family"; then
+                warn "[持久化] $key 缺少持久化配置或最终值不是 1。"
                 persistence_status=1
             else
-                info "IPv4 转发按加载优先级合并后的最终持久化值为 1。"
+                info "[持久化] $key = 1"
             fi
-        else
-            warn "[持久化] 未发现本脚本 IPv4 转发持久化文件。"
-            persistence_status=1
         fi
-    elif (( config_ok )); then
-        info "配置中没有转发规则，不要求开启 IPv4 forwarding。"
-    fi
 
-    if runtime_table_exists; then
-        runtime_table_is_owned \
-            && info "运行表所有权哨兵存在。" \
-            || { err "运行表缺少所有权哨兵。"; status=1; }
-        if runtime_output="$(nft -nn list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)"; then
-            runtime_output="$(normalize_runtime_nft_dump <<< "$runtime_output")"
+        if ! runtime_table_is_owned "$family"; then
+            err "运行中缺少 table $family $TABLE_NAME 或其所有权哨兵。"
+            status=1
+        elif (( config_ok )) && runtime_table_matches_loaded_config "$family"; then
+            info "table $family $TABLE_NAME 的运行态链和规则表达式与配置一致。"
         else
+            err "table $family $TABLE_NAME 的运行态链或规则表达式与配置不一致。"
             status=1
         fi
-        if (( config_ok )) && runtime_rules_match_loaded_config "$runtime_output"; then
-            info "运行态链结构及每条 DNAT/SNAT 表达式与配置一致。"
-        else
-            err "运行态链结构或规则表达式与配置不一致。"
-            status=1
-        fi
-    else
-        err "运行中缺少 table ${TABLE_FAMILY} ${TABLE_NAME}。"
-        status=1
+    done < <(table_families)
+    if (( config_ok )); then
+        for family in ip ip6; do
+            if [[ -z "${checked_tables[$family]:-}" ]] && runtime_table_is_owned "$family"; then
+                err "运行中存在配置未声明的托管表 $family $TABLE_NAME。"
+                status=1
+            fi
+        done
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-enabled --quiet nftables 2>/dev/null; then
+        if nftables_is_enabled_at_boot; then
             info "[持久化] nftables.service 已设为开机自启。"
-            nftables_service_uses_main_conf || {
-                warn "[持久化] nftables.service 未明确引用 ${MAIN_CONF}；当前入口不匹配。"
-                persistence_status=1
-            }
         else
             warn_nftables_service_not_enabled "[持久化] "
             persistence_status=1
         fi
+        if ! nftables_service_uses_main_conf; then
+            warn "[持久化] nftables.service 的启动命令未确认使用 ${MAIN_CONF}。请查看 systemctl cat nftables。"
+            persistence_status=1
+        fi
         systemctl is-active --quiet nftables 2>/dev/null \
-            || warn "nftables.service 当前未运行；运行表由本脚本直接维护。"
+            || info "nftables.service 当前未运行，运行表由本脚本直接维护。"
     else
         warn "[持久化] 未发现 systemctl，无法验证 nftables 开机加载入口。"
         persistence_status=1
@@ -1565,6 +1655,15 @@ handle_cli_args() {
 }
 
 # ---------- rule CRUD ----------
+print_rule_summary() {
+    local number="$1" rule="$2"
+    local listen_ip lport proto dip dport iif source_cidr rule_name
+    IFS='|' read -r listen_ip lport proto dip dport iif source_cidr rule_name <<< "$rule"
+    printf '  %d. 「%s」 %s %s -> %s (iif=%s, source=%s)\n' \
+        "$number" "${rule_name:-未命名}" "$proto" \
+        "$(format_endpoint "$listen_ip" "$lport")" "$(format_endpoint "$dip" "$dport")" "${iif:-*}" "$source_cidr"
+}
+
 list_rules() {
     load_rules_from_conf || {
         err "配置无效，拒绝显示不完整的规则列表。"
@@ -1576,40 +1675,36 @@ list_rules() {
         return 0
     fi
 
-    printf "\n%-4s %-6s %-21s %-22s %-10s %-18s\n" "No." "Proto" "Listen" "Destination" "IIF" "Source"
-    printf "%-4s %-6s %-21s %-22s %-10s %-18s\n" "----" "------" "---------------------" "----------------------" "----------" "------------------"
-
-    local i=1
-    local r listen_ip lport proto dip dport iif source_cidr
+    local i=1 r
+    echo
     for r in "${RULES[@]+"${RULES[@]}"}"; do
-        IFS='|' read -r listen_ip lport proto dip dport iif source_cidr <<< "$r"
-        iif="${iif:-*}"
-        printf "%-4s %-6s %-21s %-22s %-10s %-18s\n" \
-            "$i" "$proto" "${listen_ip}:${lport}" "${dip}:${dport}" "$iif" "$source_cidr"
+        print_rule_summary "$i" "$r"
         ((i++))
     done
     echo
 }
 
-prompt_listen_ipv4() {
-    local __var_name="$1"
+prompt_listen_ip() {
+    local __var_name="$1" family="$2" label=IPv4 flag=-4
+    if [[ "$family" == ip6 ]]; then label=IPv6; flag=-6; fi
     local value ans _idx _if _fam cidr _rest choice default_idx=0 choices_hint=""
     local -a local_ips=()
     local has_private=0
 
     while read -r _idx _if _fam cidr _rest; do
         value="${cidr%/*}"
-        validate_ipv4 "$value" || continue
+        [[ ! "$_rest" =~ (tentative|dadfailed) ]] || continue
+        value="$(normalize_ip "$family" "$value")" || continue
         local_ips+=("$value")
-        ipv4_is_rfc1918 "$value" && has_private=1
-    done < <(ip -o -4 addr show scope global 2>/dev/null || true)
+        [[ "$family" == ip ]] && ipv4_is_rfc1918 "$value" && has_private=1
+    done < <(ip -o "$flag" addr show scope global 2>/dev/null || true)
 
     # 默认优先选第一个内网地址（云 1:1 NAT 常见）；否则选列表第一项。
     if [[ ${#local_ips[@]} -gt 0 ]]; then
         default_idx=1
         _idx=1
         for value in "${local_ips[@]}"; do
-            if ipv4_is_rfc1918 "$value"; then
+            if (( has_private )) && ipv4_is_rfc1918 "$value"; then
                 default_idx="$_idx"
                 break
             fi
@@ -1623,14 +1718,14 @@ prompt_listen_ipv4() {
 
     echo
     if [[ ${#local_ips[@]} -gt 0 ]]; then
-        info "检测到本机全局 IPv4（请选包到达本机时的目的地址）："
+        info "检测到本机全局 ${label}（请选包到达本机时的目的地址）："
         _idx=1
         for value in "${local_ips[@]}"; do
             printf "  %d) %s\n" "$_idx" "$value"
             ((_idx++))
         done
     else
-        warn "未检测到本机全局 IPv4。"
+        warn "未检测到本机全局 ${label}。"
     fi
     if (( has_private )); then
         warn "若公网 IP 未出现在上方列表，云厂商多为 1:1 NAT：应选内网 IP，不要填公网。"
@@ -1638,10 +1733,10 @@ prompt_listen_ipv4() {
 
     while true; do
         if (( default_idx > 0 )); then
-            read_or_cancel choice "请选择前端监听 IPv4 [${choices_hint}，默认 ${default_idx}]: " || return 1
+            read_or_cancel choice "请选择前端监听 ${label} [${choices_hint}，默认 ${default_idx}]: " || return 1
             choice="${choice:-$default_idx}"
         else
-            read_or_cancel choice "请输入前端监听 IPv4（必须明确指定）: " || return 1
+            read_or_cancel choice "请输入前端监听 ${label}（必须明确指定）: " || return 1
         fi
         value="$choice"
         if [[ "$choice" =~ ^[0-9]{1,5}$ && ${#local_ips[@]} -gt 0 ]]; then
@@ -1649,21 +1744,23 @@ prompt_listen_ipv4() {
             if (( _idx >= 0 && _idx < ${#local_ips[@]} )); then
                 value="${local_ips[$_idx]}"
             else
-                err "请输入 ${choices_hint}，或直接输入 IPv4 地址。"
+                err "请输入 ${choices_hint}，或直接输入 ${label} 地址。"
                 continue
             fi
         fi
-        validate_ipv4 "$value" || {
+        value="$(normalize_ip "$family" "$value")" || {
             if (( default_idx > 0 )); then
-                err "请输入 ${choices_hint}，或直接输入合法 IPv4 地址。"
+                err "请输入 ${choices_hint}，或直接输入合法 ${label} 地址。"
             else
-                err "监听 IPv4 非法或属于特殊地址段。"
+                err "监听 ${label} 非法或属于特殊地址段。"
             fi
             continue
         }
-        if ! ipv4_is_local "$value"; then
+        if ! ip_is_local "$family" "$value"; then
             warn "${value} 当前未配置在本机接口上。"
-            if (( has_private )); then
+            if [[ "$family" == ip6 ]]; then
+                warn "请确认此 IPv6 地址会被路由到本机。"
+            elif (( has_private )); then
                 warn "云主机常见情况：公网只做 NAT，进机流量的目的 IP 是内网地址；填公网会导致规则匹配不到。"
             else
                 warn "仅适合稍后接管的 VIP；若这是云公网映射地址，通常应改用本机实际接口 IP。"
@@ -1677,44 +1774,97 @@ prompt_listen_ipv4() {
 }
 
 prompt_source_cidr() {
-    local __var_name="$1"
-    local value
+    local __var_name="$1" family="$2" value default=0.0.0.0/0
+    [[ "$family" == ip6 ]] && default=::/0
     while true; do
-        read_or_cancel value "允许的来源 CIDR [默认 0.0.0.0/0]: " || return 1
-        value="${value:-0.0.0.0/0}"
-        validate_ipv4_cidr "$value" || { err "来源 CIDR 非法，例如 203.0.113.0/24。"; continue; }
+        read_or_cancel value "允许的来源 CIDR [默认 $default]: " || return 1
+        value="$(normalize_ip "$family" "${value:-$default}" cidr)" || {
+            err "请输入同一地址族的网络前缀，主机位必须为零。"
+            continue
+        }
         printf -v "$__var_name" '%s' "$value"
         return 0
     done
 }
 
-show_runtime() {
-    if nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1; then
-        nft list table "$TABLE_FAMILY" "$TABLE_NAME"
-    else
-        warn "运行中未找到表 ${TABLE_FAMILY} ${TABLE_NAME}"
+prompt_rule_name() {
+    local __var_name="$1" prompt="$2" input
+    while true; do
+        read_or_cancel input "$prompt" || return 1
+        if validate_rule_name "$input"; then
+            printf -v "$__var_name" '%s' "$input"
+            return 0
+        fi
+        err "名称不能包含竖线 | 或控制字符。"
+    done
+}
+
+rename_rule_interactive() {
+    local choice count index old_rule old_name new_name candidate
+    local listen_ip lport proto dip dport iif source_cidr
+
+    list_rules || return 1
+    count="${#RULES[@]}"
+    (( count > 0 )) || return 0
+
+    while true; do
+        read_or_cancel choice "请输入规则序号（0=返回）: " || return 0
+        [[ "$choice" == "0" ]] && return 0
+        if [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -le ${#count} ]] && (( choice <= count )); then
+            break
+        fi
+        err "请输入 1 至 ${count} 的规则序号。"
+    done
+
+    index=$((choice - 1))
+    old_rule="${RULES[index]}"
+    IFS='|' read -r listen_ip lport proto dip dport iif source_cidr old_name <<< "$old_rule"
+    info "第 ${choice} 条规则当前名称为「${old_name:-未命名}」。"
+    prompt_rule_name new_name "输入新名称（回车清除）: " || return 0
+    [[ "$new_name" != "$old_name" ]] || return 0
+
+    ensure_dirs
+    if [[ -e "$TXN_MARKER" || -L "$TXN_MARKER" ]]; then
+        err "存在未恢复的规则事务，请重新启动脚本执行恢复。"
+        return 1
     fi
+    candidate="$(mktemp "${CONF_DIR}/.portfwd-name.XXXXXX")" || return 1
+
+    # 名称仅用于托管注释，修改时只需原子替换磁盘配置。
+    RULES[index]="${listen_ip}|${lport}|${proto}|${dip}|${dport}|${iif}|${source_cidr}${new_name:+|$new_name}"
+    if ! cp -p "$CONF_FILE" "$candidate" || ! render_conf_file "$candidate" \
+        || ! mv -f "$candidate" "$CONF_FILE"; then
+        RULES[index]="$old_rule"
+        rm -f "$candidate" || true
+        err "保存规则名称失败。"
+        return 1
+    fi
+    info "第 ${choice} 条规则已保存为「${new_name:-未命名}」。"
+}
+
+show_runtime() {
+    local family
+    while read -r family; do
+        nft list table "$family" "$TABLE_NAME" || warn "无法读取 table $family $TABLE_NAME"
+    done < <(table_families)
 }
 
 add_rule_interactive() {
     load_rules_from_conf || return 1
     assert_loaded_config_safe || return 1
 
-    local listen_ip lport dip dport iif source_cidr ans target _path _iface
+    local listen_ip lport dip dport iif source_cidr rule_name ans target family _path _iface
     local -a old_rules=()
     local -a protos_requested=() protos_to_add=()
 
     prompt_proto_choice protos_requested || return 0
 
     while true; do
-        read_or_cancel target "请输入目标地址 (IP:端口): " || return 0
-        if [[ "$target" =~ ^([0-9.]+):([0-9]+)$ ]]; then
-            dip="${BASH_REMATCH[1]}"
-            dport="${BASH_REMATCH[2]}"
-            validate_ipv4 "$dip" && validate_port "$dport" && break
-        fi
-        err "格式应为 IPv4:端口，例如 10.0.0.2:8080"
+        read_or_cancel target "请输入目标地址 (IPv4:端口 或 [IPv6]:端口): " || return 0
+        parse_target "$target" dip dport && break
+        err "目标格式错误，例如 10.0.0.2:8080 或 [2001:db8::2]:8080。"
     done
+    family="$(address_family "$dip")"
 
     confirm_continue_despite_unreachable_dest "$dip" "$dport" || return 0
 
@@ -1725,10 +1875,10 @@ add_rule_interactive() {
         err "端口无效。"
     done
 
-    confirm_continue_despite_local_port_use "$lport" || return 0
+    confirm_continue_despite_local_port_use "$lport" "$family" || return 0
 
-    prompt_listen_ipv4 listen_ip || return 0
-    prompt_source_cidr source_cidr || return 0
+    prompt_listen_ip listen_ip "$family" || return 0
+    prompt_source_cidr source_cidr "$family" || return 0
 
     iif="*"
     read_or_cancel ans "是否限制入口网卡？[y/N]: " || return 0
@@ -1785,7 +1935,7 @@ add_rule_interactive() {
     protos_to_add=()
     for p in "${protos_requested[@]}"; do
         if rule_conflicts "$listen_ip" "$lport" "$p" "$iif"; then
-            warn "监听范围重叠，跳过：${listen_ip}:${lport}/${p} (iif=${iif})"
+            warn "监听范围重叠，跳过：$(format_endpoint "$listen_ip" "$lport")/${p} (iif=${iif})"
         else
             protos_to_add+=("$p")
         fi
@@ -1795,10 +1945,12 @@ add_rule_interactive() {
         return 0
     fi
 
+    prompt_rule_name rule_name "规则名称（可选，例如 家里 NAS）: " || return 0
     echo
     info "将添加规则（DNAT + SNAT）:"
+    info "名称为「${rule_name:-未命名}」。"
     for p in "${protos_to_add[@]}"; do
-        echo "  ${p} ${listen_ip}:${lport} -> ${dip}:${dport} (snat=本机出口IP, iif=${iif}, source=${source_cidr})"
+        echo "  ${p} $(format_endpoint "$listen_ip" "$lport") -> $(format_endpoint "$dip" "$dport") (snat=本机出口IP, iif=${iif}, source=${source_cidr})"
     done
 
     read_or_cancel ans "确认继续? [y/N]: " || return 0
@@ -1807,11 +1959,11 @@ add_rule_interactive() {
         return 0
     }
 
-    plan_ip_forward_for_add || return 0
-    plan_nftables_enable_for_add || return 0
+    plan_ip_forward_for_add "$family" || return 0
+    plan_nftables_enable || return 0
     old_rules=("${RULES[@]+"${RULES[@]}"}")
     for p in "${protos_to_add[@]}"; do
-        RULES+=("${listen_ip}|${lport}|${p}|${dip}|${dport}|${iif}|${source_cidr}")
+        RULES+=("${listen_ip}|${lport}|${p}|${dip}|${dport}|${iif}|${source_cidr}${rule_name:+|$rule_name}")
     done
 
     if ! commit_rules; then
@@ -1819,14 +1971,14 @@ add_rule_interactive() {
         err "规则提交失败。"
         return 1
     fi
-    if ! apply_ip_forward_plan; then
-        err "IPv4 转发设置失败，正在撤销刚提交的规则。"
+    if ! apply_ip_forward_plan "$family"; then
+        err "${FORWARD_KEYS[$family]} 设置失败，正在撤销刚提交的规则。"
         RULES=("${old_rules[@]+"${old_rules[@]}"}")
         commit_rules || die "撤销规则失败，请立即检查 ${CONF_FILE} 与运行表。"
         return 1
     fi
     if ! apply_nftables_enable_plan; then
-        err "规则已提交，但启用 nftables.service 失败；可稍后手动执行 systemctl enable --now nftables。"
+        err "规则已提交，但设置开机加载失败；请用菜单 4 检查。"
     fi
 
     info "规则添加成功。"
@@ -1845,7 +1997,6 @@ delete_rule_interactive() {
     list_rules
 
     local choice ans idx i r
-    local victim listen_ip lport proto dip dport iif source_cidr
     local -a del_idxs=() new_rules=()
     local -A del_set=()
 
@@ -1874,10 +2025,7 @@ delete_rule_interactive() {
     echo
     info "将删除 ${#del_idxs[@]} 条规则:"
     for idx in "${del_idxs[@]}"; do
-        victim="${RULES[$idx]}"
-        IFS='|' read -r listen_ip lport proto dip dport iif source_cidr <<< "$victim"
-        iif="${iif:-*}"
-        echo "  ${proto} ${listen_ip}:${lport} -> ${dip}:${dport} (iif=${iif}, source=${source_cidr})"
+        print_rule_summary "$((idx + 1))" "${RULES[$idx]}"
     done
 
     read_or_cancel ans "确认继续? [y/N]: " || return 0
@@ -1905,7 +2053,7 @@ delete_rule_interactive() {
 
     info "已删除 ${#del_idxs[@]} 条。"
     [[ ${#RULES[@]} -ne 0 ]] \
-        || warn "规则已清空；为避免影响其他路由/VPN/容器，不会自动关闭 IPv4 forwarding。"
+        || warn "规则已清空；为避免影响其他路由/VPN/容器，保留系统当前的 IP 转发设置。"
 }
 
 # 解析删除序号（1-based，空格/逗号分隔，支持中文逗号）。
@@ -2019,13 +2167,19 @@ clear_rules_interactive() {
     commit_rules || return 1
 
     info "已清空。"
-    warn "为避免影响其他路由/VPN/容器，不会自动关闭 IPv4 forwarding。"
+    warn "为避免影响其他路由/VPN/容器，保留系统当前的 IP 转发设置。"
 }
 
 init_empty_conf_if_needed() {
+    local ipv4_addrs ipv6_addrs
     ensure_dirs
     if [[ ! -f "$CONF_FILE" ]]; then
         RULES=()
+        CONFIG_TABLES=()
+        if ipv4_addrs="$(ip -o -4 addr show scope global)" && [[ -z "$ipv4_addrs" ]] \
+            && ipv6_addrs="$(ip -o -6 addr show scope global)" && [[ -n "$ipv6_addrs" ]]; then
+            CONFIG_TABLES[ip6]=1
+        fi
         CONFIG_LOAD_ERRORS=0
         commit_rules || return 1
         info "已初始化空配置: $CONF_FILE"
@@ -2033,19 +2187,20 @@ init_empty_conf_if_needed() {
     return 0
 }
 
-# 仅覆盖 setup_environment_interactive 实际会处理的项。
-# 运行态表达式比对属于健康检查（--check / 菜单 4 快检），不在此反复打扰。
+# 启动时用较轻的检查发现基础环境和缺失的运行表。
+# 逐条规则比对由菜单 4 和健康检查执行。
 environment_needs_attention() {
-    local ipf
-    [[ ! -f "$CONF_FILE" ]] && return 0
-    main_conf_has_include || return 0
+    local family
+    local -a selected
+    [[ -f "$CONF_FILE" ]] && main_conf_has_include || return 0
     load_rules_from_conf >/dev/null 2>&1 || return 0
-    (( CONFIG_LOAD_ERRORS == 0 )) || return 0
-    if (( ${#RULES[@]} > 0 )); then
-        check_snat_ip_current >/dev/null 2>&1 || return 0
-        ipf="$(get_ip_forward_value)" || return 0
-        [[ "$ipf" != "1" ]] && return 0
-    fi
+    for family in ip ip6; do
+        family_rules "$family" selected
+        (( ${#selected[@]} )) || continue
+        check_snat_ip_current "$family" >/dev/null 2>&1 || return 0
+        [[ "$(get_ip_forward_value "$family")" == 1 ]] || return 0
+        runtime_table_exists "$family" || return 0
+    done
     return 1
 }
 
@@ -2054,86 +2209,113 @@ maybe_first_run_setup() {
 
     if environment_needs_attention; then
         echo
-        info "检测到环境待处理项（配置 / include / IPv4 转发）。"
+        info "检测到配置、运行表或转发环境有待检查。"
         read_or_cancel ans "是否现在检查并修复？[Y/n]: " || return 0
         if answer_yes_default_yes "$ans"; then
-            setup_environment_interactive || return 1
+            repair_environment_and_check || warn "仍有未解决的项目，可稍后使用菜单 4。"
         else
             warn "已跳过，可稍后使用菜单 4。"
         fi
     fi
 }
 
-setup_environment_interactive() {
-    local cur ans snat_check_rc
-
-    info "检查并修复：配置文件、持久化 include、IPv4 转发；不会自动启动通用 nftables.service。"
-    init_empty_conf_if_needed || return 1
-    check_include_hint || return 1
-    load_rules_from_conf || return 1
-    if (( ${#RULES[@]} == 0 )); then
-        info "当前没有转发规则，不需要开启 IPv4 forwarding。"
-        return 0
-    fi
-
-    if check_snat_ip_current; then
-        :
-    else
-        snat_check_rc=$?
-        (( snat_check_rc == 1 )) || return 1
-        read_or_cancel ans "是否以当前出口 IPv4 重新提交现有规则？[Y/n]: " || return 0
-        if answer_yes_default_yes "$ans"; then
-            commit_rules || return 1
-            info "已更新 LOCAL_IP 并重新提交现有规则。"
+update_snat_addresses_interactive() {
+    local family rc drift=0 ans
+    local -a selected
+    for family in ip ip6; do
+        family_rules "$family" selected
+        (( ${#selected[@]} )) || continue
+        if check_snat_ip_current "$family"; then
+            continue
         else
-            warn "已跳过更新 LOCAL_IP；现有静态 SNAT 可能无法正常转发。"
+            rc=$?
         fi
-    fi
+        (( rc == 1 )) || return 1
+        drift=1
+    done
+    (( drift )) || return 0
+    read_or_cancel ans "是否以当前出口地址重新提交现有规则？[Y/n]: " || return 1
+    answer_yes_default_yes "$ans" || return 1
+    commit_rules || return 1
+    info "已更新静态 SNAT 出口地址。"
+}
 
-    cur="$(get_ip_forward_value)" || {
-        err "无法读取 net.ipv4.ip_forward"
+setup_environment_interactive() {
+    local family key cur ans status=0
+    local -a selected
+
+    if [[ -e "$TXN_MARKER" || -L "$TXN_MARKER" ]]; then
+        err "存在未恢复的规则事务，请重新启动脚本执行恢复。"
         return 1
-    }
-    if [[ "$cur" == "1" ]]; then
-        info "net.ipv4.ip_forward 已经是 1"
-        if ! ip_forward_is_persisted; then
-            read_or_cancel ans "是否持久化到 ${SYSCTL_FILE}？[y/N]: " || return 0
-            if answer_yes_default_no "$ans"; then
-                enable_ip_forward_persist || return 1
+    fi
+    info "检查托管配置、内核转发、运行表和开机加载。"
+    init_empty_conf_if_needed || return 1
+    load_rules_from_conf || return 1
+    check_include_hint || status=1
+
+    for family in ip ip6; do
+        family_rules "$family" selected
+        (( ${#selected[@]} )) || continue
+        key="${FORWARD_KEYS[$family]}"
+        if ! cur="$(get_ip_forward_value "$family")"; then
+            err "无法读取 $key。"
+            status=1
+            continue
+        fi
+        if [[ "$cur" != 1 ]]; then
+            warn_ipv6_ra_forwarding "$family"
+            read_or_cancel ans "是否现在开启 $key？[Y/n]: " || return "$status"
+            answer_yes_default_yes "$ans" || continue
+            if ! enable_ip_forward_runtime "$family"; then
+                status=1
+                continue
             fi
         fi
-        return 0
-    fi
-
-    echo
-    read_or_cancel ans "是否现在开启 IPv4 转发？[Y/n]: " || return 0
-    if answer_yes_default_yes "$ans"; then
-        enable_ip_forward_runtime || return 1
-        read_or_cancel ans "是否同时持久化到 ${SYSCTL_FILE}？[y/N]: " || return 0
-        if answer_yes_default_no "$ans"; then
-            enable_ip_forward_persist || return 1
+        if ! ip_forward_is_persisted "$family"; then
+            read_or_cancel ans "是否持久化到 ${FORWARD_FILES[$family]}？[y/N]: " || return "$status"
+            if answer_yes_default_no "$ans"; then
+                enable_ip_forward_persist "$family" || status=1
+            fi
         fi
-    else
-        warn "已跳过开启 IPv4 转发。"
+    done
+
+    update_snat_addresses_interactive || return 1
+    repair_runtime_interactive || return 1
+    if plan_nftables_enable; then
+        apply_nftables_enable_plan || status=1
     fi
+    return "$status"
+}
+
+repair_environment_and_check() {
+    local status=0
+    setup_environment_interactive || status=1
+    run_health_check strict || status=1
+    return "$status"
 }
 
 check_and_fix_environment_interactive() {
-    local ans
+    local ans status=0
+    repair_environment_and_check || status=1
+    show_forward_filter_hints
 
-    setup_environment_interactive || return 1
-    check_forward_status
-
-    read_or_cancel ans "是否查看使用说明？[y/N]: " || return 0
+    read_or_cancel ans "是否查看使用说明？[y/N]: " || return "$status"
     if answer_yes_default_no "$ans"; then
         show_tips
     fi
+    return "$status"
 }
 
 view_rules_interactive() {
     echo
     list_rules || return 1
-    maybe_prompt_nftables_enable_or_restart || warn "启用/重启 nftables.service 未成功。"
+    if (( ${#RULES[@]} > 0 )); then
+        if ! repair_runtime_interactive; then
+            warn "运行态问题仍待处理，可用菜单 4 核对。"
+        elif plan_nftables_enable; then
+            apply_nftables_enable_plan || warn "设置开机加载失败，可用菜单 4 核对。"
+        fi
+    fi
     local ans
     read_or_cancel ans "显示原始 nft 规则？[y/N]: " || return 0
     if answer_yes_default_no "$ans"; then
@@ -2142,7 +2324,6 @@ view_rules_interactive() {
 }
 
 add_rule_menu_action() {
-    init_empty_conf_if_needed || return 1
     add_rule_interactive
 }
 
@@ -2180,7 +2361,8 @@ show_config_error_guidance() {
 
 只读校验命令：
   nft -c -f ${CONF_FILE}
-  nft list table ${TABLE_FAMILY} ${TABLE_NAME}
+  nft list table ip ${TABLE_NAME}
+  nft list table ip6 ${TABLE_NAME}
 
 事务文件状态（只读）：
   marker:    ${TXN_MARKER} [$(diagnostic_file_state "$TXN_MARKER")]
@@ -2241,12 +2423,13 @@ menu() {
         cat <<EOF
 
 ========================================
- ${SCRIPT_DISPLAY_NAME}  |  ip_forward=$(get_ip_forward_display)  |  规则 ${rule_count} 条
+ ${SCRIPT_DISPLAY_NAME}  |  IPv4=$(get_ip_forward_display ip)  IPv6=$(get_ip_forward_display ip6)  |  规则 ${rule_count} 条
 ========================================
 1) 添加转发
 2) 查看规则
 3) 删除规则
 4) 检查并修复环境
+5) 修改规则名称
 0) 退出
 ========================================
 EOF
@@ -2257,6 +2440,7 @@ EOF
             2) run_menu_action view_rules_interactive ;;
             3) run_menu_action delete_rule_interactive ;;
             4) run_menu_action check_and_fix_environment_interactive ;;
+            5) run_menu_action rename_rule_interactive ;;
             0) exit 0 ;;
             *) err "无效选择。" ;;
         esac

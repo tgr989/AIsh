@@ -85,11 +85,11 @@ cli_docs="$(print_help; show_tips)"
 [[ "$cli_docs" != *'./nft-portfwd.sh --check'* ]] \
     || fail 'SNAT CLI docs still point to the MASQUERADE script'
 version_output="$(handle_cli_args --version)"
-[[ "$version_output" == 'nft-portfwd v2.2.4 (static-snat)' ]] \
+[[ "$version_output" == 'nft-portfwd v2.3.0 (static-snat)' ]] \
     || fail 'SNAT version output does not identify its mode'
 
 [[ "$TABLE_NAME" == "portfwd" ]] || fail 'unexpected table name'
 [[ "$CONF_FILE" == "/etc/nftables.d/portfwd.conf" ]] || fail 'unexpected config path'
-[[ "$SCRIPT_VERSION" == "2.2.4" ]] || fail 'unexpected script version'
+[[ "$SCRIPT_VERSION" == "2.3.0" ]] || fail 'unexpected script version'
 
 printf 'PASS: nft-portfwd-snat offline tests\n'

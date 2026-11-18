@@ -176,10 +176,19 @@ load_rules_from_conf() { return 1; }
 expect_fail list_rules >/dev/null 2>&1
 unset -f load_rules_from_conf
 
-setup_environment_interactive() { return 1; }
-check_forward_status() { fail 'environment check continued after setup failure'; }
-expect_fail check_and_fix_environment_interactive
-unset -f setup_environment_interactive check_forward_status
+(
+    checked=0
+    setup_environment_interactive() { return 1; }
+    run_health_check() {
+        [[ "$1" == strict ]] || fail 'repair verification did not include persistence'
+        checked=1
+        return 0
+    }
+    show_forward_filter_hints() { return 0; }
+    read_or_cancel() { printf -v "$1" '%s' 'n'; }
+    expect_fail check_and_fix_environment_interactive
+    [[ "$checked" == 1 ]] || fail 'repair failure hid the remaining health issues'
+)
 
 load_rules_from_conf() {
     RULES=("192.0.2.10|8443|tcp|10.0.0.2|443|eth0|203.0.113.0/24")
@@ -200,7 +209,7 @@ expect_ok finish_health_check 0 0 strict >/dev/null 2>&1
 CLI_MODE="menu"
 expect_ok handle_cli_args --check-strict
 [[ "$CLI_MODE" == "check-strict" ]] || fail '--check-strict did not select strict mode'
-[[ "$SCRIPT_VERSION" == "2.2.4" ]] || fail 'unexpected script version'
+[[ "$SCRIPT_VERSION" == "2.3.0" ]] || fail 'unexpected script version'
 help_out="$(print_help)"
 grep -Fq "$CONF_FILE" <<< "$help_out" || fail 'help omitted managed conf path'
 grep -Fq "$SYSCTL_FILE" <<< "$help_out" || fail 'help omitted sysctl path'
@@ -209,94 +218,76 @@ grep -Fq '不会自动改动' <<< "$help_out" || fail 'help omitted non-touch su
 grep -Fq '添加规则时可选择启用 nftables.service' <<< "$help_out" \
     || fail 'help omitted optional nftables enable note'
 
-systemctl() {
-    [[ "$1" == "is-enabled" ]] && return 1
-    return 0
-}
-read_or_cancel() { printf -v "$1" '%s' ''; }
-NFT_WANT_ENABLE=1
-expect_ok plan_nftables_enable_for_add
-[[ "$NFT_WANT_ENABLE" == "0" ]] || fail 'empty answer should leave nftables enable off'
-read_or_cancel() { printf -v "$1" '%s' 'y'; }
-expect_ok plan_nftables_enable_for_add
-[[ "$NFT_WANT_ENABLE" == "1" ]] || fail 'y should request nftables enable'
-systemctl() {
-    [[ "$1" == "is-enabled" ]] && return 0
-    return 0
-}
-NFT_WANT_ENABLE=1
-expect_ok plan_nftables_enable_for_add
-[[ "$NFT_WANT_ENABLE" == "0" ]] || fail 'already-enabled nftables should skip prompt'
-unset -f systemctl read_or_cancel
-NFT_WANT_ENABLE=0
+(
+    printf '%s\n' 'include "/etc/nftables.d/portfwd.conf"; # managed rules' > "$invalid_tmp"
+    expect_ok main_conf_has_include "$invalid_tmp"
+    printf '%s\n' 'include "/etc/nftables.d/*.conf" # managed rules' > "$invalid_tmp"
+    expect_ok main_conf_has_include "$invalid_tmp"
+    printf '%s\n' '# include "/etc/nftables.d/*.conf"' > "$invalid_tmp"
+    expect_fail main_conf_has_include "$invalid_tmp"
 
-nft() {
-    [[ "$1" == "-nn" && "$2" == "list" && "$3" == "chain" ]] || return 1
-    printf '%s\n' \
-        'type nat hook prerouting priority dstnat; policy accept;' \
-        'ip daddr 192.0.2.10 tcp dport 8443 dnat to 10.0.0.2:443' \
-        'ip daddr 192.0.2.10 udp dport 8443 dnat to 10.0.0.2:443'
-}
-[[ "$(count_runtime_dnat_rules)" == "2" ]] || fail 'count_runtime_dnat_rules should count DNAT lines'
-nft() { return 1; }
-[[ "$(count_runtime_dnat_rules)" == "0" ]] || fail 'missing runtime chain should count as 0'
-expect_fail count_runtime_dnat_rules >/dev/null
+    service_state=enabled-runtime
+    service_conf="$MAIN_CONF"
+    enable_calls=0
+    enable_persists=0
+    systemctl() {
+        case "$*" in
+            'show nftables --property=ExecStart --value')
+                printf '{ path=/usr/sbin/nft ; argv[]=/usr/sbin/nft -f %s ; }\n' "$service_conf"
+                ;;
+            'is-enabled nftables') printf '%s\n' "$service_state" ;;
+            'enable nftables')
+                (( ++enable_calls ))
+                if (( enable_persists )); then service_state=enabled; fi
+                ;;
+            *) fail "unexpected systemctl operation: $*" ;;
+        esac
+    }
+    main_conf_has_include() { return 0; }
+    secure_root_file() { [[ "$1" == "$MAIN_CONF" ]]; }
+    run_nft() { [[ "$*" == "-c -f $MAIN_CONF" ]]; }
 
-RULES=("192.0.2.10|8443|tcp|10.0.0.2|443|*|0.0.0.0/0")
-main_conf_has_include() { return 0; }
-nftables_service_uses_main_conf() { return 0; }
-nft() {
-    [[ "$1" == "-nn" && "$2" == "list" && "$3" == "chain" ]] || return 1
-    printf '%s\n' 'ip daddr 192.0.2.10 tcp dport 8443 dnat to 10.0.0.2:443'
-}
-systemctl() {
-    case "$1" in
-        is-enabled|is-active) return 0 ;;
-        *) return 0 ;;
-    esac
-}
-prompted=0
-read_or_cancel() { prompted=1; printf -v "$1" '%s' 'n'; }
-expect_ok maybe_prompt_nftables_enable_or_restart >/dev/null
-[[ "$prompted" == "0" ]] || fail 'matching enabled/active runtime should not prompt'
+    expect_fail nftables_is_enabled_at_boot
+    prompt_answer=""
+    read_or_cancel() { printf -v "$1" '%s' "$prompt_answer"; }
+    NFT_WANT_ENABLE=1
+    expect_ok plan_nftables_enable
+    [[ "$NFT_WANT_ENABLE" == 0 ]] || fail 'boot enable must be opt-in'
+    prompt_answer=y
+    expect_ok plan_nftables_enable
+    [[ "$NFT_WANT_ENABLE" == 1 ]] || fail 'runtime-only enablement should be repairable'
+    expect_fail apply_nftables_enable_plan >/dev/null 2>&1
+    [[ "$enable_calls" == 1 ]] || fail 'boot enable should be verified after systemctl returns'
 
-nft() {
-    [[ "$1" == "-nn" && "$2" == "list" && "$3" == "chain" ]] || return 1
-    printf '%s\n' 'type nat hook prerouting priority dstnat; policy accept;'
-}
-prompted=0
-restart_called=0
-read_or_cancel() { prompted=1; printf -v "$1" '%s' ''; }
-systemctl() {
-    case "$1" in
-        is-enabled|is-active) return 0 ;;
-        restart) restart_called=1; return 0 ;;
-        *) return 0 ;;
-    esac
-}
-expect_ok maybe_prompt_nftables_enable_or_restart >/dev/null
-[[ "$prompted" == "1" ]] || fail 'count mismatch should prompt enable/restart'
-[[ "$restart_called" == "1" ]] || fail 'default Y should restart enabled nftables'
+    service_conf="$MAIN_CONF.backup"
+    expect_fail nftables_service_uses_main_conf
+    expect_ok plan_nftables_enable
+    [[ "$NFT_WANT_ENABLE" == 0 ]] || fail 'offered to enable a unit using another config'
+    expect_fail enable_nftables_at_boot >/dev/null 2>&1
+    [[ "$enable_calls" == 1 ]] || fail 'unit using another config was enabled'
 
-enable_called=0
-systemctl() {
-    case "$1" in
-        is-enabled|is-active) return 1 ;;
-        enable) enable_called=1; return 0 ;;
-        *) return 0 ;;
-    esac
-}
-nft() {
-    [[ "$1" == "-nn" && "$2" == "list" && "$3" == "chain" ]] || return 1
-    printf '%s\n' 'ip daddr 192.0.2.10 tcp dport 8443 dnat to 10.0.0.2:443'
-}
-prompted=0
-read_or_cancel() { prompted=1; printf -v "$1" '%s' 'n'; }
-expect_ok maybe_prompt_nftables_enable_or_restart >/dev/null
-[[ "$prompted" == "1" ]] || fail 'disabled nftables should prompt even when counts match'
-[[ "$enable_called" == "0" ]] || fail 'answering n should skip enable/restart'
-unset -f nft systemctl read_or_cancel main_conf_has_include nftables_service_uses_main_conf
-RULES=()
+    service_conf="$MAIN_CONF"
+    enable_persists=1
+    expect_ok plan_nftables_enable
+    expect_ok apply_nftables_enable_plan >/dev/null
+    expect_ok nftables_is_enabled_at_boot
+    expect_ok plan_nftables_enable
+    [[ "$NFT_WANT_ENABLE" == 0 && "$enable_calls" == 2 ]] || fail 'already permanent enable should skip prompt'
+)
+
+(
+    RULES=("192.0.2.10|8443|tcp|10.0.0.2|443|eth0|203.0.113.0/24")
+    nft() {
+        [[ "$*" == '-nn list table ip portfwd' && -n "$current_table" ]] || return 1
+        printf '%s\n' "$current_table"
+    }
+    current_table="$runtime_output"
+    expect_ok runtime_table_matches_loaded_config ip
+    current_table="$tampered_output"
+    expect_fail runtime_table_matches_loaded_config ip
+    current_table=""
+    expect_fail runtime_table_matches_loaded_config ip
+)
 
 del_idxs=()
 expect_ok parse_rule_delete_selection '1,3 5' 5 del_idxs

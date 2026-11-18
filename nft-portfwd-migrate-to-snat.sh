@@ -38,7 +38,7 @@ print_help() {
 
 作用:
   将 ${CONF_FILE} 从 DNAT + MASQUERADE 原位迁移为 DNAT + 静态 SNAT。
-  自动探测默认路由出口 IPv4 并写为 define LOCAL_IP；
+  按规则地址族探测出口地址，IPv4 使用 LOCAL_IP，IPv6 使用 LOCAL_IP6。
   表名、配置路径及规则元数据保持不变。
 
 要求:
@@ -184,20 +184,21 @@ BASH
 }
 
 render_snat_candidate() {
-    local old_conf="$1" output_path="$2" snat_ip_override="${3:-}"
-    bash -s -- "$TARGET_SCRIPT" "$old_conf" "$output_path" "$snat_ip_override" <<'BASH'
+    local old_conf="$1" output_path="$2"
+    bash -s -- "$TARGET_SCRIPT" "$old_conf" "$output_path" "${3:-}" "${4:-}" <<'BASH'
 set -euo pipefail
 source "$1"
 RULES=()
 while IFS= read -r line || [[ -n "$line" ]]; do
+    record_table_header "$line" && continue
     if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*RULE:[[:space:]]*(.+)[[:space:]]*$ ]]; then
         RULES+=("${BASH_REMATCH[1]}")
     fi
 done < "$2"
 CONFIG_LOAD_ERRORS=0
-if [[ -n "$4" ]]; then
-    validate_ipv4 "$4"
+if [[ -n "$4$5" ]]; then
     SNAT_IP="$4"
+    if [[ -n "$5" ]]; then SNAT_IP6="$(normalize_ip ip6 "$5")"; fi
 else
     refresh_snat_ip
 fi
@@ -207,9 +208,10 @@ BASH
 
 build_runtime_rollback() {
     local output_path="$1"
-    bash -s -- "$SOURCE_SCRIPT" "$output_path" <<'BASH'
+    bash -s -- "$SOURCE_SCRIPT" "$output_path" "${2:-$CONF_FILE}" <<'BASH'
 set -euo pipefail
 source "$1"
+load_rules_from_conf "$3"
 check_runtime_ownership
 build_runtime_rollback "$2"
 BASH
@@ -221,40 +223,36 @@ verify_snat_runtime() {
 set -euo pipefail
 source "$1"
 load_rules_from_conf "$2"
-runtime_table_exists || {
-    printf '%s\n' '[ERR ] 运行中缺少受管 table。' >&2
-    exit 1
-}
-runtime_table_is_owned || {
-    printf '%s\n' '[ERR ] 运行表缺少所有权哨兵。' >&2
-    exit 1
-}
-expected_rule_count="${#RULES[@]}"
-for chain in "$CHAIN_PREROUTING" "$CHAIN_POSTROUTING"; do
-    chain_output="$(nft -a list chain "$TABLE_FAMILY" "$TABLE_NAME" "$chain" 2>/dev/null)" || {
-        printf '%s\n' "[ERR ] 运行表缺少受管链：${chain}" >&2
-        exit 1
-    }
-    runtime_rule_count=0
-    while IFS= read -r handle_line || [[ -n "$handle_line" ]]; do
-        [[ "$handle_line" =~ \#[[:space:]]handle[[:space:]][0-9]+[[:space:]]*$ ]] || continue
-        if [[ "$handle_line" =~ ^[[:space:]]*(table|chain)[[:space:]] ]]; then
-            continue
-        fi
-        (( ++runtime_rule_count ))
-    done <<< "$chain_output"
-    if (( runtime_rule_count != expected_rule_count )); then
-        printf '%s\n' \
-            "[ERR ] 运行链 ${chain} 的规则数为 ${runtime_rule_count}，候选配置应为 ${expected_rule_count}。" >&2
+display_mismatch=0
+mapfile -t families < <(table_families)
+for family in "${families[@]}"; do
+    runtime_table_exists "$family" || { err "运行中缺少受管 table $family $TABLE_NAME。"; exit 1; }
+    if ! runtime_table_is_owned "$family"; then
+        printf '[ERR ] 运行表缺少所有权哨兵。table %s %s\n' "$family" "$TABLE_NAME" >&2
         exit 1
     fi
+    family_rules "$family" selected
+    expected_rule_count="${#selected[@]}"
+    for chain in "$CHAIN_PREROUTING" "$CHAIN_POSTROUTING"; do
+        chain_output="$(nft -a list chain "$family" "$TABLE_NAME" "$chain")" || {
+            err "运行表缺少受管链：$family $TABLE_NAME $chain"
+            exit 1
+        }
+        runtime_rule_count=0
+        while IFS= read -r handle_line; do
+            [[ "$handle_line" =~ \#[[:space:]]handle[[:space:]][0-9]+[[:space:]]*$ ]] || continue
+            [[ "$handle_line" =~ ^[[:space:]]*(table|chain)[[:space:]] ]] && continue
+            (( ++runtime_rule_count ))
+        done <<< "$chain_output"
+        if (( runtime_rule_count != expected_rule_count )); then
+            err "运行链 $family $chain 的规则数为 ${runtime_rule_count}，候选配置应为 ${expected_rule_count}。"
+            exit 1
+        fi
+    done
+    runtime_output="$(nft -nn list table "$family" "$TABLE_NAME" | normalize_runtime_nft_dump "$family")" || exit 1
+    runtime_rules_match_loaded_config "$runtime_output" "$family" || display_mismatch=1
 done
-runtime_output="$(nft -nn list table "$TABLE_FAMILY" "$TABLE_NAME")" || {
-    printf '%s\n' '[ERR ] 无法读取已加载的 SNAT 运行表。' >&2
-    exit 1
-}
-runtime_output="$(normalize_runtime_nft_dump <<< "$runtime_output")"
-if ! runtime_rules_match_loaded_config "$runtime_output"; then
+if (( display_mismatch )); then
     printf '%s\n' '[WARN] SNAT 运行态展示文本与候选配置不完全一致。' >&2
     printf '%s\n' "[WARN] nftables 版本：$(nft --version 2>/dev/null || printf 'unknown')" >&2
     exit 2
@@ -276,8 +274,8 @@ rollback_failed_migration() {
 confirm_migration() {
     local answer
     (( ASSUME_YES == 1 )) && return 0
-    printf '\n将原位更新 %s 及运行中的 table ip portfwd。\n' "$CONF_FILE"
-    printf '将自动使用本机默认路由出口 IPv4 作为 LOCAL_IP；旧配置备份会永久保留。\n'
+    printf '\n将原位更新 %s 及相应的 ip/ip6 portfwd 表。\n' "$CONF_FILE"
+    printf '将按地址族探测本机出口并保留旧配置备份。\n'
     printf '迁移后请使用 nft-portfwd-snat.sh。\n'
     read -rp "确认从 MASQUERADE 迁移到静态 SNAT？[y/N]: " answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]]
@@ -309,7 +307,7 @@ main() {
     OWNED_ARTIFACTS=1
     render_snat_candidate "$CONF_FILE" "$TXN_CANDIDATE" \
         || die "无法生成 SNAT 候选配置。"
-    info "检测到 SNAT LOCAL_IP：$(grep -E '^[[:space:]]*define[[:space:]]+LOCAL_IP' "$TXN_CANDIDATE" | head -n 1 | sed -E 's/.*=[[:space:]]*//')"
+    sed -nE 's/^define (LOCAL_IP6?) = (.*)$/SNAT \1 = \2/p' "$TXN_CANDIDATE"
     chmod 0640 "$TXN_CANDIDATE" || die "无法设置候选配置权限。"
     validate_config_with "$TARGET_SCRIPT" "$TXN_CANDIDATE" \
         || die "SNAT 候选配置未通过完整性校验。"
