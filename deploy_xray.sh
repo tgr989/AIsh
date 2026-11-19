@@ -55,7 +55,7 @@ Xray 官方安装器：
   每次从 GitHub 解析 XTLS/Xray-install 最新 commit（默认分支 main）
   下载 install-release.sh 并用 git blob SHA 校验
   可用环境变量 INSTALLER_REF 覆盖分支/tag/commit
-  执行参数：install -u root --logrotate "06:07:08"
+  使用 install --logrotate "06:07:08" 安装，服务使用 systemd 配置的账户
 
 支持的系统：
   Debian 12 / 13
@@ -671,17 +671,14 @@ INSTALLER_FILE="${TEMP_DIR}/install-release.sh"
 
 fetch_official_installer "${INSTALLER_FILE}"
 
-log "运行官方安装器（User=root，日志轮换时间 06:07:08）..."
-INSTALL_ARGS=(install -u root --logrotate "06:07:08")
+log "运行官方安装器（日志轮换时间 06:07:08）..."
+INSTALL_OPTIONS=(--logrotate "06:07:08")
 INSTALLER_EXECUTED=1
-bash "${INSTALLER_FILE}" "${INSTALL_ARGS[@]}"
+bash "${INSTALLER_FILE}" install "${INSTALL_OPTIONS[@]}"
 
 [[ -x "${XRAY_BIN}" ]] || die "Xray 安装失败：未找到 ${XRAY_BIN}"
 
 SERVICE_REPAIR_REQUIRED=0
-INSTALLED_SERVICE_USER="$(
-  systemctl show -p User --value xray.service 2>/dev/null || true
-)"
 INSTALLED_SERVICE_EXEC_START="$(
   systemctl show -p ExecStart --value xray.service 2>/dev/null || true
 )"
@@ -689,10 +686,6 @@ EXPECTED_SERVICE_COMMAND="${XRAY_BIN} run -config ${SERVER_CONFIG}"
 
 if ! systemctl cat xray.service >/dev/null 2>&1; then
   log "未找到有效的 xray.service，需要由官方安装器修复。"
-  SERVICE_REPAIR_REQUIRED=1
-fi
-if [[ "${INSTALLED_SERVICE_USER:-root}" != "root" ]]; then
-  log "xray.service 当前未以 root 运行，需要由官方安装器修复。"
   SERVICE_REPAIR_REQUIRED=1
 fi
 if ! service_exec_start_is_expected \
@@ -706,18 +699,12 @@ fi
 
 if ((SERVICE_REPAIR_REQUIRED == 1)); then
   log "重新安装以修复 Xray 官方服务配置..."
-  bash "${INSTALLER_FILE}" \
-    install --reinstall -u root --logrotate "06:07:08"
+  bash "${INSTALLER_FILE}" install --reinstall "${INSTALL_OPTIONS[@]}"
   systemctl daemon-reload
 fi
 
 systemctl cat xray.service >/dev/null 2>&1 ||
   die "未找到有效的 xray.service。"
-INSTALLED_SERVICE_USER="$(
-  systemctl show -p User --value xray.service 2>/dev/null || true
-)"
-[[ "${INSTALLED_SERVICE_USER:-root}" == "root" ]] ||
-  die "Xray systemd 服务未能切换为 root 用户。"
 INSTALLED_SERVICE_EXEC_START="$(
   systemctl show -p ExecStart --value xray.service 2>/dev/null || true
 )"
@@ -725,6 +712,16 @@ service_exec_start_is_expected \
   "${INSTALLED_SERVICE_EXEC_START}" "${EXPECTED_SERVICE_COMMAND}" ||
   die "xray.service 未使用预期配置文件 ${SERVER_CONFIG}。"
 assert_logrotate_timer
+
+SERVICE_USER="$(systemctl show -p User --value xray.service)" ||
+  die "无法读取 xray.service 的运行用户。"
+SERVICE_USER="${SERVICE_USER:-root}"
+SERVICE_GROUP="$(systemctl show -p Group --value xray.service)" ||
+  die "无法读取 xray.service 的运行组。"
+if [[ -z "${SERVICE_GROUP}" ]]; then
+  SERVICE_GROUP="$(id -gn -- "${SERVICE_USER}")" ||
+    die "无法确定 ${SERVICE_USER} 的主组。"
+fi
 
 UUID=""
 PRIVATE_KEY=""
@@ -931,10 +928,13 @@ cat >>"${SERVER_CONFIG_TMP}" <<EOF
 }
 EOF
 
-log "校验服务端配置..."
-"${XRAY_BIN}" run -test -config "${SERVER_CONFIG_TMP}"
+install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0700 /var/log/xray
+log "以 ${SERVICE_USER}:${SERVICE_GROUP} 校验服务端配置..."
+# 配置校验也会打开日志文件，通过 stdin 读取私有临时配置。
+runuser -u "${SERVICE_USER}" -g "${SERVICE_GROUP}" -- \
+  "${XRAY_BIN}" run -test -config stdin: <"${SERVER_CONFIG_TMP}"
 
-mkdir -p "${DEPLOY_DIR}" "${XRAY_CONFIG_DIR}" /var/log/xray
+mkdir -p "${DEPLOY_DIR}"
 chmod 700 "${DEPLOY_DIR}"
 
 if [[ -e "${SERVER_CONFIG}" ]]; then
@@ -948,24 +948,10 @@ if [[ -e "${SERVER_CONFIG}" ]]; then
   log "旧配置已备份到 ${BACKUP_DIR}"
 fi
 
-SERVICE_USER="$(systemctl show -p User --value xray.service 2>/dev/null || true)"
-SERVICE_USER="${SERVICE_USER:-root}"
-if id "${SERVICE_USER}" >/dev/null 2>&1; then
-  SERVICE_GROUP="$(id -gn "${SERVICE_USER}")"
-else
-  SERVICE_USER="root"
-  SERVICE_GROUP="root"
-fi
-
+install -d -o root -g "${SERVICE_GROUP}" -m 0750 "${XRAY_CONFIG_DIR}"
 install -o root -g "${SERVICE_GROUP}" -m 0640 \
   "${SERVER_CONFIG_TMP}" "${SERVER_CONFIG}"
 CONFIG_COMMITTED=1
-touch /var/log/xray/access.log /var/log/xray/error.log
-chown "${SERVICE_USER}:${SERVICE_GROUP}" /var/log/xray
-chown "${SERVICE_USER}:${SERVICE_GROUP}" \
-  /var/log/xray/access.log /var/log/xray/error.log
-chmod 0750 /var/log/xray
-chmod 0640 /var/log/xray/access.log /var/log/xray/error.log
 
 URI_HOST="${SERVER_ADDRESS}"
 if [[ "${URI_HOST}" == *:* && "${URI_HOST}" != \[*\] ]]; then
