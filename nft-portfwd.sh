@@ -19,7 +19,7 @@ TABLE_NAME="portfwd"
 CHAIN_PREROUTING="prerouting"
 CHAIN_POSTROUTING="postrouting"
 SCRIPT_DISPLAY_NAME="nft-portfwd"
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.4.0"
 
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/portfwd.conf"
@@ -384,6 +384,56 @@ format_endpoint() {
     fi
 }
 
+# 返回 2 可重输目标，返回 3 表示选择地址时遇到 EOF。
+resolve_target_hostname() {
+    local host="$1" port="$2"
+    local -n selected_addr="$3"
+    local reply candidate canonical count choice i
+    local -a addresses=()
+    local -A seen=()
+
+    if ! command -v getent >/dev/null 2>&1; then
+        err "解析主机名需要 getent，也可直接输入目标 IP。"
+        return 2
+    fi
+    if ! reply="$(getent ahosts "$host" 2>/dev/null)"; then
+        err "无法解析目标主机 $host。"
+        return 2
+    fi
+    while read -r candidate _; do
+        canonical="$(normalize_ip "$(address_family "$candidate")" "$candidate")" || continue
+        [[ -z "${seen[$canonical]:-}" ]] || continue
+        seen[$canonical]=1
+        addresses+=("$canonical")
+    done <<< "$reply"
+
+    count="${#addresses[@]}"
+    if (( count == 0 )); then
+        err "目标主机 $host 没有可用的 IPv4 或 IPv6 转发地址。"
+        return 2
+    fi
+
+    choice=1
+    if (( count > 1 )); then
+        info "目标主机 $host 有多个可用地址。"
+        for i in "${!addresses[@]}"; do
+            printf '  %d) %s\n' "$((i + 1))" "$(format_endpoint "${addresses[i]}" "$port")"
+        done
+        while true; do
+            read_or_cancel choice "请选择目标地址（0=重新输入）: " || return 3
+            [[ "$choice" == 0 ]] && return 2
+            if [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -le ${#count} ]] && (( choice <= count )); then
+                break
+            fi
+            err "请输入 1 至 $count 的序号，或输入 0 返回。"
+        done
+    fi
+
+    selected_addr="${addresses[choice - 1]}"
+    info "目标主机 $host 选用 $(format_endpoint "$selected_addr" "$port")。"
+}
+
+# 返回 1 表示目标格式或端口无效，2 和 3 沿用主机名选择的状态。
 parse_target() {
     local target="$1" parsed_addr parsed_port family
     local -n out_addr="$2" out_port="$3"
@@ -391,11 +441,17 @@ parse_target() {
         parsed_addr="${BASH_REMATCH[1]}" parsed_port="${BASH_REMATCH[2]}" family=ip6
     elif [[ "$target" =~ ^([0-9.]+):([0-9]+)$ ]]; then
         parsed_addr="${BASH_REMATCH[1]}" parsed_port="${BASH_REMATCH[2]}" family=ip
+    elif [[ "$target" =~ ^([[:alnum:]_][[:alnum:]_.-]*):([0-9]+)$ ]]; then
+        parsed_addr="${BASH_REMATCH[1]}" parsed_port="${BASH_REMATCH[2]}" family=host
     else
         return 1
     fi
     validate_port "$parsed_port" || return 1
-    parsed_addr="$(normalize_ip "$family" "$parsed_addr")" || return 1
+    if [[ "$family" == host ]]; then
+        resolve_target_hostname "$parsed_addr" "$parsed_port" parsed_addr || return $?
+    else
+        parsed_addr="$(normalize_ip "$family" "$parsed_addr")" || return 1
+    fi
     out_addr="$parsed_addr"
     out_port="$parsed_port"
 }
@@ -1448,7 +1504,8 @@ ${SCRIPT_DISPLAY_NAME} v${SCRIPT_VERSION}
     --check-strict   严格检查；持久化问题也返回失败
 
 说明:
-    - 目标支持 IPv4:端口 或 [IPv6]:端口，例如 [2001:db8::2]:443
+    - 目标可填 IPv4:端口、[IPv6]:端口或主机名:端口，例如 nas.example.net:443
+    - 主机名通过 getent 解析，规则保存选定的数字 IP
     - 默认进入交互菜单模式
     - 模式固定为 DNAT + MASQUERADE；静态 SNAT 请使用 nft-portfwd-snat.sh
     - 菜单与两种 --check 需要 root 权限；--help/--version 不需要
@@ -1828,16 +1885,23 @@ add_rule_interactive() {
     load_rules_from_conf || return 1
     assert_loaded_config_safe || return 1
 
-    local listen_ip lport dip dport iif source_cidr rule_name ans target family _path _iface
+    local listen_ip lport dip dport iif source_cidr rule_name ans target target_status family _path _iface
     local -a old_rules=()
     local -a protos_requested=() protos_to_add=()
 
     prompt_proto_choice protos_requested || return 0
 
     while true; do
-        read_or_cancel target "请输入目标地址 (IPv4:端口 或 [IPv6]:端口): " || return 0
-        parse_target "$target" dip dport && break
-        err "目标格式错误，例如 10.0.0.2:8080 或 [2001:db8::2]:8080。"
+        read_or_cancel target "请输入目标地址 (IPv4:端口、[IPv6]:端口 或 主机名:端口): " || return 0
+        if parse_target "$target" dip dport; then
+            break
+        else
+            target_status=$?
+        fi
+        case "$target_status" in
+            1) err "目标格式错误，例如 10.0.0.2:8080、[2001:db8::2]:8080 或 nas.example.net:8080。" ;;
+            3) return 0 ;;
+        esac
     done
     family="$(address_family "$dip")"
 

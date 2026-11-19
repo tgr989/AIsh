@@ -38,7 +38,9 @@ Choose one active manager for a host. Do not alternate between the MASQUERADE an
 | Typical fit | Dynamic addresses or multiple egress paths | Stable, single-egress VPS routing |
 | Backend sees real client IP | No | No |
 
-Both variants match the listen address, port, protocol, optional ingress interface and optional source prefix. Select a backend using `IPv4:port` or `[IPv6]:port`. Each rule forwards within one address family (IPv4 NAT or NAT66). Both families can use the same port in the same configuration.
+Both variants match the listen address, port, protocol, optional ingress interface and optional source prefix. Select a backend using `IPv4:port`, `[IPv6]:port`, or a hostname such as `nas.example.net:443`. Each rule forwards within one address family (IPv4 NAT or NAT66). Both families can use the same port in the same configuration.
+
+When you add a hostname target, the script queries the system resolver with `getent ahosts`. Choose an address when the resolver returns multiple usable results. The selected IP determines the rule's address family and is saved in the configuration. If the hostname later resolves to a different IP, recreate the rule to select the new address.
 
 ## Requirements
 
@@ -46,6 +48,7 @@ Both variants match the listen address, port, protocol, optional ingress interfa
 - Root privileges for menu, health-check and migration operations
 - `nftables`, `iproute2`, `procps` (`sysctl`) and `util-linux` (`flock`)
 - Standard GNU/Linux tools used by the scripts (`grep`, `stat`, `install`, `mktemp`, `cmp`, and related core utilities)
+- Hostname targets require `getent` with the `ahosts` database
 - `systemctl` is optional, but without it boot-time nftables loading cannot be verified
 
 The managers do not install these dependencies automatically.
@@ -238,7 +241,7 @@ Keep `nft-portfwd-snat.sh`. The permanent pre-migration backup is reported in th
 
 ## Interactive workflow
 
-1. Menu `1` adds a forward with an optional name. Enter the backend, such as `[2001:db8::8]:443`, and select a listen address of the same family, the protocol, and any source or ingress restrictions.
+1. Menu `1` adds a forward with an optional name. Enter the backend, such as `[2001:db8::8]:443` or `nas.example.net:443`, and select a listen address of the same family, the protocol, and any source or ingress restrictions.
 2. Menu `2` lists managed rules and their names. It can also display the raw nftables table.
 3. Menu `3` deletes rules by list number and shows their names before confirmation. You can select multiple rules with spaces, commas, or `n+`/`n-`. Enter `all` to clear all rules.
 4. Menu `4` checks IP forwarding and offers to restore missing or drifted managed tables from the saved configuration. It can also configure boot loading with confirmation and then runs the strict health check. The SNAT version offers to refresh changed egress addresses.

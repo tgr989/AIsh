@@ -30,6 +30,9 @@ for script in nft-portfwd.sh nft-portfwd-snat.sh; do (
                       '[1::2::3]:80' '[1:::2]:80' '[1:2:3:4:5:6:7::8]:80' '[64:ff9b::192.0.02.1]:80'; do
             expect_fail parse_target "$target" dip dport
         done
+        status=0
+        parse_target 'nas.example.test:443' dip dport </dev/null >/dev/null 2>&1 || status=$?
+        [[ "$status" == 2 ]] || fail 'missing getent should report lookup failure'
         [[ "$(normalize_ip ip6 '0:0:0:0:0:0:0:0/0' cidr)" == '::/0' ]] || fail 'default IPv6 prefix'
         [[ "$(normalize_ip ip6 '2001:0DB8::/64' cidr)" == '2001:db8::/64' ]] || fail 'IPv6 prefix'
         [[ "$(normalize_ip ip6 '2001:db8:0:0:8000::/65' cidr)" == '2001:db8:0:0:8000::/65' ]] || fail 'partial group prefix'
@@ -41,6 +44,42 @@ for script in nft-portfwd.sh nft-portfwd-snat.sh; do (
             expect_fail normalize_ip ip6 "$cidr" cidr
         done
     )
+
+    getent() {
+        case "$*" in
+            'ahosts nas.example.test')
+                printf '%s\n' '192.0.2.20 STREAM nas.example.test' '192.0.2.20 DGRAM' \
+                    '::ffff:192.0.2.20 STREAM' 'FD00:0002:0:0::2 STREAM' \
+                    'fd00:2::2 DGRAM' 'fe80::1 RAW'
+                ;;
+            'ahosts ipv4.example.test.')
+                printf '%s\n' '192.0.2.20 STREAM ipv4.example.test.' '192.0.2.20 DGRAM'
+                ;;
+            'ahosts filtered.example.test')
+                printf '%s\n' '127.0.0.1 STREAM' '::1 STREAM'
+                ;;
+            'ahosts failed.example.test')
+                printf '%s\n' '192.0.2.20 STREAM'
+                return 2
+                ;;
+            *) fail "unexpected resolution request: $*" ;;
+        esac
+    }
+    parse_target 'ipv4.example.test.:443' dip dport </dev/null >/dev/null
+    [[ "$dip" == 192.0.2.20 && "$dport" == 443 ]] || fail 'single hostname result'
+    status=0
+    parse_target 'nas.example.test:443' dip dport </dev/null >/dev/null 2>&1 || status=$?
+    [[ "$status" == 3 ]] || fail 'cancelled hostname selection'
+    for invalid in 'filtered.example.test:443' 'failed.example.test:443'; do
+        status=0
+        parse_target "$invalid" dip dport </dev/null >/dev/null 2>&1 || status=$?
+        [[ "$status" == 2 && "$dip" == 192.0.2.20 ]] || fail 'hostname lookup failure retained an unusable result'
+    done
+    for invalid in 'http://nas.example.test:443' 'nas.example.test:65536' '--help:443' '999.0.0.1:443'; do
+        status=0
+        parse_target "$invalid" dip dport </dev/null >/dev/null 2>&1 || status=$?
+        [[ "$status" == 1 ]] || fail 'malformed target reached the resolver'
+    done
 
     RULES=("$v4" "$named_v6" "$udp6")
     SNAT_IP=192.0.2.10 SNAT_IP6=2001:db8::10
@@ -121,8 +160,10 @@ for script in nft-portfwd.sh nft-portfwd-snat.sh; do (
     plan_nftables_enable() { return 0; }
     commit_rules() { render_conf_file "$conf"; }
     show_persistence_hint() { return 0; }
-    add_rule_interactive <<< $'3\n[fd00:2::2]:443\n8443\n2001:0DB8::10\n\nn\nbad|name\n家庭 NAS # HTTPS\ny' \
+    add_rule_interactive <<< $'3\nfailed.example.test:443\nnas.example.test:443\n0\nnas.example.test:443\n2\n8443\n2001:0DB8::10\n\nn\nbad|name\n家庭 NAS # HTTPS\ny' \
         > "$bad_conf" 2>&1
+    grep -Fq '目标主机 nas.example.test 选用 [fd00:2::2]:443' "$bad_conf"
+    expect_fail grep -Fq '目标格式错误' "$bad_conf"
     grep -Fq "名称为「$rule_name」" "$bad_conf"
     [[ "${RULES[0]}" == "${udp6/|udp|/|tcp|}|$rule_name" && "${RULES[1]}" == "$udp6|$rule_name" ]] \
         || fail 'dual-protocol IPv6 naming'
